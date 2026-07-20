@@ -5,6 +5,7 @@ Flask backend — dynamic instance list with add/remove API.
 
 import json
 import os
+import re
 import time
 import threading
 import traceback
@@ -244,7 +245,8 @@ def collect_instance(inst):
         # --- pg_stat_statements -------------------------------------------
         try:
             result["top_queries"] = query(conn, """
-                SELECT LEFT(query, 150) AS query,
+                SELECT queryid::text AS queryid,
+                       LEFT(query, 150) AS query,
                        calls,
                        ROUND(total_exec_time::numeric, 2)  AS total_ms,
                        ROUND(mean_exec_time::numeric,  2)  AS mean_ms,
@@ -258,13 +260,18 @@ def collect_instance(inst):
 
         # --- EDB extensions (graceful degradation, [] = installed+empty) --
         for name, sql in [
-            ("stat_monitor", "SELECT bucket_start_time,dbname,username,LEFT(query,100) AS query,"
+            ("stat_monitor", "SELECT bucket_start_time,datname AS dbname,username,LEFT(query,100) AS query,"
              "calls,ROUND(total_exec_time::numeric,2) AS total_ms,"
              "ROUND(mean_exec_time::numeric,2) AS mean_ms,cpu_user_time,cpu_sys_time "
-             "FROM edbsm_queries ORDER BY total_exec_time DESC LIMIT 10"),
-            ("wait_states",  "SELECT wait_type,wait_event,count(*) AS cnt "
-             "FROM edb_wait_states_data GROUP BY wait_type,wait_event ORDER BY cnt DESC LIMIT 20"),
-            ("index_advisor","SELECT query,index_advice FROM query_advisor_data ORDER BY 1 LIMIT 10"),
+             "FROM edb_stat_monitor ORDER BY total_exec_time DESC LIMIT 10"),
+            ("wait_states",  "SELECT wait_event_type AS wait_type, wait_event, count(*) AS cnt "
+             "FROM edb_wait_states_data() GROUP BY wait_event_type, wait_event ORDER BY cnt DESC LIMIT 20"),
+            ("index_advisor","SELECT index AS recommendation, estimated_size_in_bytes, "
+             "ROUND(estimated_pct_cost_reduction::numeric,1) AS est_cost_reduction_pct, "
+             "ROUND(abs_benefit::numeric,2) AS abs_benefit, "
+             "COALESCE(array_length(benefited_queryids,1),0) AS benefited_queries "
+             "FROM query_advisor_index_recommendations() "
+             "ORDER BY estimated_pct_cost_reduction DESC LIMIT 10"),
         ]:
             try:
                 result[name] = query(conn, sql)
@@ -426,6 +433,10 @@ def api_add_instance():
     if missing:
         return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
 
+    # Groups exist only implicitly: any non-empty string is a valid group,
+    # and groups with no remaining member instances simply cease to exist.
+    group = (body.get("group") or "").strip() or None
+
     new_id = "pg-" + uuid.uuid4().hex[:8]
     inst = {
         "id":       new_id,
@@ -435,6 +446,7 @@ def api_add_instance():
         "user":     body["user"],
         "password": body["password"],
         "dbname":   body["dbname"],
+        "group":    group,
     }
 
     with _instances_lock:
@@ -467,6 +479,7 @@ def api_remove_instance(instance_id):
 @app.route("/api/instances/<instance_id>", methods=["PUT"])
 def api_update_instance(instance_id):
     body = request.get_json(force=True)
+
     with _instances_lock:
         inst = next((i for i in _instances if i["id"] == instance_id), None)
         if not inst:
@@ -477,6 +490,7 @@ def api_update_instance(instance_id):
         if "user"     in body: inst["user"]      = body["user"]
         if "password" in body: inst["password"]  = body["password"]
         if "dbname"   in body: inst["dbname"]    = body["dbname"]
+        if "group"    in body: inst["group"]     = (body["group"] or "").strip() or None
         save_instances(_instances)
         updated = dict(inst)
 
@@ -498,6 +512,59 @@ def api_refresh_instance(instance_id):
         _cache[instance_id] = data
         _cache["_refreshed"] = datetime.now(timezone.utc).isoformat()
     return jsonify(data)
+
+
+@app.route("/api/instances/<instance_id>/explain", methods=["POST"])
+def api_explain(instance_id):
+    """Look up a pg_stat_statements query by queryid and EXPLAIN it.
+
+    Query text from pg_stat_statements is normalized ($1, $2, …) — there are
+    no real parameter values to substitute. On PG16+ we use EXPLAIN's
+    GENERIC_PLAN option, built for exactly this case. On older versions we
+    fall back to substituting NULL for each placeholder, which yields a
+    structurally correct but row-estimate-inaccurate plan.
+    """
+    body = request.get_json(force=True) or {}
+    queryid = body.get("queryid")
+    if not queryid:
+        return jsonify({"error": "missing queryid"}), 400
+
+    inst = next((i for i in get_instances() if i["id"] == instance_id), None)
+    if not inst:
+        return jsonify({"error": "unknown instance"}), 404
+
+    try:
+        conn = psycopg2.connect(make_dsn(inst))
+        conn.autocommit = True
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    try:
+        full_query = scalar(
+            conn,
+            "SELECT query FROM pg_stat_statements WHERE queryid = %s::bigint LIMIT 1",
+            (queryid,),
+        )
+        if not full_query:
+            return jsonify({"error": "query not found — it may have aged out of pg_stat_statements"}), 404
+
+        pgver = scalar(conn, "SELECT current_setting('server_version_num')::int")
+        try:
+            if pgver and pgver >= 160000:
+                rows = query(conn, f"EXPLAIN (GENERIC_PLAN, FORMAT TEXT) {full_query}")
+                mode = "generic_plan"
+            else:
+                approx_query = re.sub(r'\$\d+', 'NULL', full_query)
+                rows = query(conn, f"EXPLAIN (FORMAT TEXT) {approx_query}")
+                mode = "approximate"
+            plan_text = "\n".join(r["QUERY PLAN"] for r in rows)
+            return jsonify({"plan": plan_text, "mode": mode, "query": full_query})
+        except Exception as e:
+            return jsonify({"error": str(e), "query": full_query}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
