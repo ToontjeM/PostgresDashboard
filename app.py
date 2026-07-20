@@ -9,6 +9,7 @@ import re
 import time
 import threading
 import traceback
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -94,6 +95,56 @@ def scalar(conn, sql, params=None):
         return row[0] if row else None
 
 
+# ---------------------------------------------------------------------------
+# PostgreSQL release catalog (for "a newer version is available" hints)
+# ---------------------------------------------------------------------------
+_pg_version_catalog = {"data": None, "fetched_at": 0}
+_pg_version_catalog_lock = threading.Lock()
+PG_VERSION_CATALOG_TTL = 6 * 3600  # refetch at most every 6 hours
+
+
+def get_pg_version_catalog():
+    """Latest published patch release per PostgreSQL major version, keyed by
+    major version string (e.g. "17" -> {"latest": "17.10", ...}).
+
+    Cached in memory since this rarely changes; a fetch failure just means we
+    skip the "update available" hint until the next successful refresh.
+    """
+    now = time.time()
+    with _pg_version_catalog_lock:
+        if _pg_version_catalog["data"] is not None and now - _pg_version_catalog["fetched_at"] < PG_VERSION_CATALOG_TTL:
+            return _pg_version_catalog["data"]
+    try:
+        with urllib.request.urlopen("https://endoflife.date/api/postgresql.json", timeout=5) as resp:
+            cycles = json.load(resp)
+        catalog = {c["cycle"]: c for c in cycles}
+        with _pg_version_catalog_lock:
+            _pg_version_catalog["data"] = catalog
+            _pg_version_catalog["fetched_at"] = now
+        return catalog
+    except Exception:
+        with _pg_version_catalog_lock:
+            return _pg_version_catalog["data"]
+
+
+def find_newer_pg_version(version_short):
+    """Return the latest published patch version if it's newer than
+    `version_short` (e.g. "14.23 (Debian ...)"), else None."""
+    m = re.match(r'(\d+)\.(\d+)', version_short or "")
+    if not m:
+        return None
+    major, minor = m.group(1), int(m.group(2))
+    catalog = get_pg_version_catalog()
+    cycle = catalog.get(major) if catalog else None
+    if not cycle:
+        return None
+    latest = cycle.get("latest") or ""
+    lm = re.search(r'\.(\d+)$', latest)
+    if lm and int(lm.group(1)) > minor:
+        return latest
+    return None
+
+
 def collect_instance(inst):
     result = {
         "id":           inst["id"],
@@ -112,6 +163,7 @@ def collect_instance(inst):
         result["version"]          = scalar(conn, "SELECT version()")
         result["pg_version_num"]   = scalar(conn, "SELECT current_setting('server_version_num')::int")
         result["pg_version_short"] = scalar(conn, "SHOW server_version")
+        result["pg_latest_version"] = find_newer_pg_version(result["pg_version_short"])
 
         # --- Uptime --------------------------------------------------------
         result["server_start"]  = str(scalar(conn, "SELECT pg_postmaster_start_time()"))
@@ -269,7 +321,8 @@ def collect_instance(inst):
             ("index_advisor","SELECT index AS recommendation, estimated_size_in_bytes, "
              "ROUND(estimated_pct_cost_reduction::numeric,1) AS est_cost_reduction_pct, "
              "ROUND(abs_benefit::numeric,2) AS abs_benefit, "
-             "COALESCE(array_length(benefited_queryids,1),0) AS benefited_queries "
+             "COALESCE(array_length(benefited_queryids,1),0) AS benefited_queries, "
+             "benefited_queryids "
              "FROM query_advisor_index_recommendations() "
              "ORDER BY estimated_pct_cost_reduction DESC LIMIT 10"),
         ]:
@@ -561,6 +614,40 @@ def api_explain(instance_id):
             return jsonify({"plan": plan_text, "mode": mode, "query": full_query})
         except Exception as e:
             return jsonify({"error": str(e), "query": full_query}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/instances/<instance_id>/index-recommendation-queries", methods=["POST"])
+def api_index_recommendation_queries(instance_id):
+    """Resolve the pg_stat_statements queryids an index recommendation benefits."""
+    body = request.get_json(force=True) or {}
+    queryids = body.get("queryids")
+    if not queryids or not isinstance(queryids, list):
+        return jsonify({"error": "missing queryids"}), 400
+
+    inst = next((i for i in get_instances() if i["id"] == instance_id), None)
+    if not inst:
+        return jsonify({"error": "unknown instance"}), 404
+
+    try:
+        conn = psycopg2.connect(make_dsn(inst))
+        conn.autocommit = True
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    try:
+        rows = query(
+            conn,
+            "SELECT queryid, query, calls, ROUND(total_exec_time::numeric,2) AS total_ms, "
+            "ROUND(mean_exec_time::numeric,2) AS mean_ms "
+            "FROM pg_stat_statements WHERE queryid = ANY(%s::bigint[]) "
+            "ORDER BY total_exec_time DESC",
+            (queryids,),
+        )
+        return jsonify({"queries": rows})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:

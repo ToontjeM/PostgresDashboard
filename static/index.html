@@ -40,26 +40,26 @@
   --row-hover:     rgba(255,255,255,.025);
   --row-border:    rgba(255,255,255,.04);
 }
-/* Material-style light theme: soft neutral canvas, white elevated cards,
-   indigo/deep-purple accents — subtler than a stark white/blue theme. */
+/* Light theme: soft lavender canvas, white elevated cards, a richer
+   indigo/violet accent pair carried through hovers, rules and stat values. */
 :root[data-theme="light"] {
-  --bg:        #eef1f6;
+  --bg:        #eef1fb;
   --surface:   #ffffff;
   --card:      #ffffff;
   --border:    #e4e8ef;
-  --accent:    #5c6bc0;
-  --accent2:   #8667c9;
-  --green:     #2e7d32;
+  --accent:    #4f5fe0;
+  --accent2:   #7c3aed;
+  --green:     #15803d;
   --amber:     #b45309;
-  --red:       #c62828;
+  --red:       #dc2626;
   --muted:     #78909c;
   --text:      #263238;
   --text2:     #607d8b;
   --shadow-1:  0 1px 2px rgba(31,45,61,.06), 0 1px 3px rgba(31,45,61,.08);
   --shadow-2:  0 2px 6px rgba(31,45,61,.06), 0 8px 20px rgba(31,45,61,.10);
-  --hover-overlay: rgba(38,50,60,.045);
-  --row-hover:     rgba(38,50,60,.03);
-  --row-border:    rgba(38,50,60,.07);
+  --hover-overlay: color-mix(in srgb, var(--accent) 6%, transparent);
+  --row-hover:     color-mix(in srgb, var(--accent) 4%, transparent);
+  --row-border:    color-mix(in srgb, var(--accent) 8%, transparent);
 }
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 body {
@@ -244,6 +244,10 @@ body {
   color: var(--text); margin: 24px 0 10px; padding-bottom: 6px;
   border-bottom: 1px solid var(--border);
 }
+:root[data-theme="light"] .section-title {
+  border-bottom: 2px solid transparent;
+  border-image: linear-gradient(90deg, var(--accent), var(--accent2)) 1;
+}
 /* Panel tabs */
 .tabs-bar {
   display: flex; gap: 4px; margin-bottom: 18px; border-bottom: 1px solid var(--border);
@@ -269,6 +273,10 @@ body {
 .card-value.amber { color: var(--amber); }
 .card-value.red   { color: var(--red);   }
 .card-sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
+/* Light theme: give plain (non-status) stat numbers a shot of the brand
+   accent instead of flat neutral text, so the overview grid doesn't read
+   all-gray. Status-colored values keep their green/amber/red meaning. */
+:root[data-theme="light"] .card-value:not(.green):not(.amber):not(.red) { color: var(--accent2); }
 
 .chart-card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; box-shadow: var(--shadow-1); }
 .chart-title { font-size: 12px; font-weight: 600; color: var(--text2); margin-bottom: 10px; }
@@ -374,6 +382,27 @@ tr:hover td { background:var(--row-hover); }
   white-space:pre; color:var(--text);
 }
 
+/* Benefited queries overlay */
+#benefited-overlay {
+  position:fixed; inset:0; background:rgba(0,0,0,.6);
+  display:flex; align-items:center; justify-content:center; z-index:200;
+}
+#benefited-overlay.hidden { display:none; }
+#benefited-box {
+  background:var(--card); border:1px solid var(--border); border-radius:12px;
+  box-shadow: var(--shadow-2);
+  padding:20px; width:90%; max-width:900px; max-height:80vh;
+  display:flex; flex-direction:column; gap:10px;
+}
+#benefited-header { display:flex; align-items:center; justify-content:space-between; }
+#benefited-header h3 { font-size:16px; }
+#benefited-body { overflow:auto; }
+.link-btn {
+  background:none; border:none; padding:0; margin:0; font:inherit;
+  color:var(--accent); cursor:pointer; text-decoration:underline;
+}
+.link-btn:hover { color:var(--accent2); }
+
 /* Sortable table headers */
 th.sortable-th { cursor:pointer; user-select:none; white-space:nowrap; }
 th.sortable-th:hover { color:var(--accent) !important; }
@@ -419,6 +448,17 @@ tr.row-clickable:hover { background:color-mix(in srgb, var(--accent) 7%, transpa
     </div>
     <div id="explain-note"></div>
     <pre id="explain-body"></pre>
+  </div>
+</div>
+
+<!-- Benefited queries dialog (Query Advisor index recommendations) -->
+<div id="benefited-overlay" class="hidden">
+  <div id="benefited-box">
+    <div id="benefited-header">
+      <h3>Queries Benefiting From This Index</h3>
+      <button class="btn" onclick="closeBenefitedQueries()">✕ Close</button>
+    </div>
+    <div id="benefited-body"></div>
   </div>
 </div>
 
@@ -490,6 +530,7 @@ let instances    = [];          // ordered list from /api/instances
 let activeId     = null;
 let charts       = {};          // canvasId → Chart instance
 let histBuf      = {};          // instanceId → {tps,conn,cache,ts}[]
+let tpsMax       = {};          // instanceId → highest TPS observed this session
 let formMode     = 'new';       // 'new' | 'edit'
 let formEditId   = null;        // id being edited
 
@@ -995,6 +1036,9 @@ function buildPanel(inst, d) {
   const bgw        = d.bgwriter || {};
   const deadlocks  = (d.databases || []).reduce((s, db) => s + (db.deadlocks || 0), 0);
   const longCnt    = (d.long_queries || []).length;
+  const tps        = parseFloat(d.tps || 0);
+  tpsMax[inst.id]  = Math.max(tpsMax[inst.id] || 0, tps);
+  const tpsPct     = tpsMax[inst.id] ? Math.round(100 * tps / tpsMax[inst.id]) : 0;
 
   let h = '';
 
@@ -1004,7 +1048,10 @@ function buildPanel(inst, d) {
   h += card('Version', `
     <div class="card-value lg">${escHtml(d.pg_version_short || '—')}</div>
     <div class="card-sub">Uptime: ${uptimeStr}</div>
-    <div class="card-sub" style="margin-top:2px">${d.server_start ? 'Since ' + fmtDate(d.server_start) : ''}</div>`);
+    <div class="card-sub" style="margin-top:2px">${d.server_start ? 'Since ' + fmtDate(d.server_start) : ''}</div>
+    ${d.pg_latest_version ? `<div class="card-sub" style="margin-top:7px;color:var(--amber);font-weight:600">
+      &#8593; ${escHtml(d.pg_latest_version)} available
+    </div>` : ''}`);
 
   h += card('Connections', `
     <div class="card-value ${cc}">${c.total || 0}</div>
@@ -1021,7 +1068,12 @@ function buildPanel(inst, d) {
 
   h += card('TPS (avg since reset)', `
     <div class="card-value">${fmtNum(d.tps)}</div>
-    <div class="card-sub">transactions / second</div>`);
+    <div class="card-sub">transactions / second</div>
+    <div class="progress-wrap">
+      <div class="progress-bar"><div class="progress-fill" style="width:${tpsPct}%;background:var(--accent)"></div></div>
+      <span class="progress-pct">${tpsPct}%</span>
+    </div>
+    <div class="card-sub" style="margin-top:7px;font-size:11px">of session peak (${fmtNum(tpsMax[inst.id])})</div>`);
 
   h += card('Cache Hit Ratio', `
     <div class="card-value ${chColor}">${cacheHit}%</div>
@@ -1048,7 +1100,7 @@ function buildPanel(inst, d) {
     <div class="card-value ${deadlocks>0?'red':'green'}">${deadlocks}</div>
     <div class="card-sub">total across all databases</div>`);
 
-  h += card('Long Queries (&gt;1 s)', `
+  h += card('Long Queries (>1 s)', `
     <div class="card-value ${longCnt>5?'red':longCnt>0?'amber':'green'}">${longCnt}</div>
     <div class="card-sub">currently running</div>`);
 
@@ -1167,7 +1219,7 @@ function buildPanel(inst, d) {
   // ============================================================
   let h2 = '';
   h2 += buildPgTunerPanel(d.pg_tuner);
-  h2 += buildQueryAdvisorPanel(d.index_advisor);
+  h2 += buildQueryAdvisorPanel(inst.id, d.index_advisor);
 
   // ============================================================
   // Tab 3 — Host Statistics
@@ -1209,29 +1261,13 @@ function buildPanel(inst, d) {
 
   // ── EDB stat monitor ─────────────────────────────────────────
   if ((d.stat_monitor||[]).length) {
-    h4 += '<div class="section-title">EDB Stat Monitor</div><div class="card"><div class="tbl-wrap">';
-    h4 += `<table><thead><tr><th>Time</th><th>DB</th><th>User</th><th>Query</th><th>Calls</th><th>Total ms</th><th>Mean ms</th><th>CPU User</th><th>CPU Sys</th></tr></thead><tbody>`;
-    d.stat_monitor.forEach(q => {
-      h4 += `<tr>
-        <td style="white-space:nowrap">${fmtDate(q.bucket_start_time)}</td>
-        <td>${escHtml(q.dbname||'')}</td><td>${escHtml(q.username||'')}</td>
-        <td><code style="font-size:11px">${escHtml(q.query||'')}</code></td>
-        <td>${fmtNum(q.calls)}</td><td>${fmtNum(q.total_ms)}</td><td>${fmtNum(q.mean_ms)}</td>
-        <td>${fmtNum(q.cpu_user_time)}</td><td>${fmtNum(q.cpu_sys_time)}</td>
-      </tr>`;
-    });
-    h4 += '</tbody></table></div></div>';
+    h4 += `<div id="statmon-wrap-${inst.id}">${buildStatMonitorSection(inst.id, d.stat_monitor)}</div>`;
   }
 
   // ── Wait states ──────────────────────────────────────────────
   if ((d.wait_states||[]).length) {
     h4 += '<div class="section-title">EDB Wait States</div><div class="grid-2">';
-    h4 += '<div class="card"><div class="tbl-wrap">';
-    h4 += `<table><thead><tr><th>Type</th><th>Event</th><th>Count</th></tr></thead><tbody>`;
-    d.wait_states.forEach(w => {
-      h4 += `<tr><td>${escHtml(w.wait_type||'')}</td><td>${escHtml(w.wait_event||'')}</td><td>${w.cnt}</td></tr>`;
-    });
-    h4 += '</tbody></table></div></div>';
+    h4 += `<div id="waitstates-wrap-${inst.id}">${buildWaitStatesTable(inst.id, d.wait_states)}</div>`;
     h4 += `<div class="chart-card"><div class="chart-title">Wait Event Distribution</div><canvas id="c-wait-${inst.id}"></canvas></div>`;
     h4 += '</div>';
   }
@@ -1300,13 +1336,21 @@ function buildSystemStatsPanel(data) {
   // pg_sys_load_avg_info() columns: load_avg_one_minute, load_avg_five_minutes,
   //   load_avg_ten_minutes, load_avg_fifteen_minutes
   if (lav.load_avg_one_minute !== undefined) {
-    const la1  = parseFloat(lav.load_avg_one_minute   || 0);
-    const la5  = parseFloat(lav.load_avg_five_minutes  || 0);
-    const la15 = parseFloat(lav.load_avg_fifteen_minutes || lav.load_avg_ten_minutes || 0);
-    const cl   = la1 > 4 ? 'red' : la1 > 2 ? 'amber' : 'green';
+    const la1      = parseFloat(lav.load_avg_one_minute   || 0);
+    const la5      = parseFloat(lav.load_avg_five_minutes  || 0);
+    const la15     = parseFloat(lav.load_avg_fifteen_minutes || lav.load_avg_ten_minutes || 0);
+    const cpuInfoRows = data.cpu_info || [];
+    const numCores = parseInt(cpuInfoRows[0]?.no_of_cores) || cpuInfoRows.length;
+    const laPct    = numCores ? Math.min(100, Math.round(100 * la1 / numCores)) : 0;
+    const cl       = la1 > 4 ? 'red' : la1 > 2 ? 'amber' : 'green';
     h += card('Load Average', `
       <div class="card-value ${cl}">${la1.toFixed(2)}</div>
-      <div class="card-sub">1 min · 5 min: ${la5.toFixed(2)} · 15 min: ${la15.toFixed(2)}</div>`);
+      <div class="card-sub">1 min · 5 min: ${la5.toFixed(2)} · 15 min: ${la15.toFixed(2)}</div>
+      ${numCores ? `<div class="progress-wrap">
+        <div class="progress-bar"><div class="progress-fill" style="width:${laPct}%;background:var(--${cl})"></div></div>
+        <span class="progress-pct">${laPct}%</span>
+      </div>
+      <div class="card-sub" style="margin-top:5px;font-size:11px">of ${numCores} core${numCores===1?'':'s'}</div>` : ''}`);
   }
 
   // pg_sys_memory_info() columns: total_memory, used_memory, free_memory,
@@ -1340,7 +1384,11 @@ function buildSystemStatsPanel(data) {
     const cc      = busyPct > 85 ? 'red' : busyPct > 70 ? 'amber' : 'green';
     h += card('CPU Usage', `
       <div class="card-value ${cc}">${busyPct}%</div>
-      <div class="card-sub">busy · user ${userPct.toFixed(1)}% · sys ${sysPct.toFixed(1)}% · I/O ${ioPct.toFixed(1)}% · idle ${idlePct.toFixed(1)}%</div>`);
+      <div class="card-sub">busy · user ${userPct.toFixed(1)}% · sys ${sysPct.toFixed(1)}% · I/O ${ioPct.toFixed(1)}% · idle ${idlePct.toFixed(1)}%</div>
+      <div class="progress-wrap">
+        <div class="progress-bar"><div class="progress-fill" style="width:${busyPct}%;background:var(--${cc})"></div></div>
+        <span class="progress-pct">${busyPct}%</span>
+      </div>`);
   }
 
   h += '</div>';
@@ -1462,7 +1510,7 @@ function buildPgTunerPanel(data) {
     const snippet = alterSql.join('\n') + '\nSELECT pg_reload_conf();';
     h += `<details style="margin-top:12px">
       <summary style="cursor:pointer;font-size:12px;color:var(--accent)">
-        ▶ Show ALTER SYSTEM statements (${changed.length} change${changed.length>1?'s':''})
+        Show ALTER SYSTEM statements (${changed.length} change${changed.length>1?'s':''})
       </summary>
       <pre style="margin-top:8px;background:var(--bg);border:1px solid var(--border);
           border-radius:6px;padding:10px;font-size:11px;overflow-x:auto;white-space:pre">${escHtml(snippet)}</pre>
@@ -1502,7 +1550,7 @@ const QUERY_ADVISOR_EXAMPLES = [
     impact: 'Frees storage and speeds up inserts/updates on the table' },
 ];
 
-function buildQueryAdvisorPanel(rows) {
+function buildQueryAdvisorPanel(instId, rows) {
   const SEC = '<div class="section-title">Query Advisor — Index Recommendations <small style="font-size:11px;color:var(--muted);font-weight:400">(query_advisor extension)</small></div>';
   const live = (rows || []).length > 0;
 
@@ -1525,12 +1573,16 @@ function buildQueryAdvisorPanel(rows) {
       const pct        = parseFloat(q.est_cost_reduction_pct || 0);
       const pctColor    = pct > 50 ? 'var(--green)' : pct > 20 ? 'var(--amber)' : 'var(--text2)';
       const benefits    = q.benefited_queries || 0;
-      const queryPattern = `(workload analysis — benefits ${benefits} quer${benefits===1?'y':'ies'})`;
+      const benefitsLabel = `benefits ${benefits} quer${benefits===1?'y':'ies'}`;
+      const queryidsAttr = escAttr(JSON.stringify(q.benefited_queryids || []));
+      const benefitsText = benefits > 0
+        ? `<button class="link-btn" onclick="showBenefitedQueries('${escAttr(instId)}', '${queryidsAttr}')">${escHtml(benefitsLabel)}</button>`
+        : escHtml(benefitsLabel);
       const impact = `<span style="color:${pctColor};font-weight:600">${pct}%</span> estimated cost reduction`
         + ` · ${fmtBytes(q.estimated_size_in_bytes)} index`;
       h += `<tr>
         <td><span class="badge badge-blue">Missing Index</span></td>
-        <td><code style="font-size:11px;word-break:break-all">${escHtml(queryPattern)}</code></td>
+        <td><code style="font-size:11px;word-break:break-all">(workload analysis — ${benefitsText})</code></td>
         <td><code style="font-size:11px;word-break:break-all">${escHtml(q.recommendation||'')}</code></td>
         <td>${impact}</td>
       </tr>`;
@@ -1545,7 +1597,24 @@ function buildQueryAdvisorPanel(rows) {
       </tr>`;
     });
   }
-  h += '</tbody></table></div></div>';
+  h += '</tbody></table></div>';
+
+  // ── CREATE INDEX remediation snippet ──
+  if (live) {
+    const indexSql = rows.map(q => q.recommendation).filter(Boolean);
+    if (indexSql.length > 0) {
+      const snippet = indexSql.join('\n');
+      h += `<details style="margin-top:12px">
+        <summary style="cursor:pointer;font-size:12px;color:var(--accent)">
+          Show CREATE INDEX statements (${indexSql.length} recommendation${indexSql.length>1?'s':''})
+        </summary>
+        <pre style="margin-top:8px;background:var(--bg);border:1px solid var(--border);
+            border-radius:6px;padding:10px;font-size:11px;overflow-x:auto;white-space:pre">${escHtml(snippet)}</pre>
+      </details>`;
+    }
+  }
+
+  h += '</div>';
   return h;
 }
 
@@ -1555,12 +1624,12 @@ function buildQueryAdvisorPanel(rows) {
 const topQuerySort = {}; // instanceId -> {col, dir}
 
 const TOPQ_COLS = [
-  { key: 'query',      label: 'Query',      numeric: false },
-  { key: 'calls',      label: 'Calls',      numeric: true  },
-  { key: 'total_ms',   label: 'Total ms',   numeric: true  },
-  { key: 'mean_ms',    label: 'Mean ms',    numeric: true  },
-  { key: 'stddev_ms',  label: 'Stddev ms',  numeric: true  },
-  { key: 'rows',       label: 'Rows',       numeric: true  },
+  { key: 'query',      label: 'Query'      },
+  { key: 'calls',      label: 'Calls'      },
+  { key: 'total_ms',   label: 'Total ms'   },
+  { key: 'mean_ms',    label: 'Mean ms'    },
+  { key: 'stddev_ms',  label: 'Stddev ms'  },
+  { key: 'rows',       label: 'Rows'       },
 ];
 
 // EXPLAIN only supports "optimizable" statements (SELECT/INSERT/UPDATE/
@@ -1572,9 +1641,11 @@ function isExplainable(queryText) {
   return EXPLAINABLE_RE.test(queryText || '');
 }
 
-function buildTopQueriesSection(instId, rows) {
-  const sort = topQuerySort[instId] || { col: 'total_ms', dir: 'desc' };
-  const sorted = rows.slice().sort((a, b) => {
+// Shared by every sortable-column table (Top Queries, EDB Stat Monitor, EDB
+// Wait States): sort a copy of `rows` by `sort.col`/`sort.dir`, string- or
+// number-aware.
+function sortRows(rows, sort) {
+  return rows.slice().sort((a, b) => {
     let av = a[sort.col], bv = b[sort.col];
     if (typeof av === 'string' || typeof bv === 'string') {
       av = (av ?? '').toString().toLowerCase();
@@ -1584,15 +1655,26 @@ function buildTopQueriesSection(instId, rows) {
     av = av ?? 0; bv = bv ?? 0;
     return sort.dir === 'asc' ? av - bv : bv - av;
   });
+}
 
-  let h = '<div class="section-title">Top Queries by Total Execution Time (pg_stat_statements) <small style="font-size:11px;color:var(--muted);font-weight:400">(click applicable rows for their execution plan)</small></div>';
-  h += '<div class="card"><div class="tbl-wrap"><table><thead><tr>';
-  TOPQ_COLS.forEach(c => {
+function sortableHeaderRow(cols, sort, onclickFn, instId) {
+  let h = '<tr>';
+  cols.forEach(c => {
     const active = sort.col === c.key;
     const arrow  = active ? (sort.dir === 'asc' ? ' ▲' : ' ▼') : '';
-    h += `<th class="sortable-th" style="${active?'color:var(--accent)':''}" onclick="resortTopQueries('${escAttr(instId)}','${c.key}')">${escHtml(c.label)}${arrow}</th>`;
+    h += `<th class="sortable-th" style="${active?'color:var(--accent)':''}" onclick="${onclickFn}('${escAttr(instId)}','${c.key}')">${escHtml(c.label)}${arrow}</th>`;
   });
-  h += '</tr></thead><tbody>';
+  return h + '</tr>';
+}
+
+function buildTopQueriesSection(instId, rows) {
+  const sort = topQuerySort[instId] || { col: 'total_ms', dir: 'desc' };
+  const sorted = sortRows(rows, sort);
+
+  let h = '<div class="section-title">Top Queries by Total Execution Time (pg_stat_statements) <small style="font-size:11px;color:var(--muted);font-weight:400">(click applicable rows for their execution plan)</small></div>';
+  h += '<div class="card"><div class="tbl-wrap"><table><thead>';
+  h += sortableHeaderRow(TOPQ_COLS, sort, 'resortTopQueries', instId);
+  h += '</thead><tbody>';
   sorted.forEach(q => {
     const explainable = isExplainable(q.query);
     const rowAttrs = explainable
@@ -1616,6 +1698,89 @@ function resortTopQueries(instId, col) {
   const wrap = document.getElementById('topq-wrap-' + instId);
   const rows = (allData[instId] || {}).top_queries;
   if (wrap && rows) wrap.innerHTML = buildTopQueriesSection(instId, rows);
+}
+
+// ============================================================
+// EDB Stat Monitor — sortable table
+// ============================================================
+const statMonitorSort = {}; // instanceId -> {col, dir}
+
+const STAT_MONITOR_COLS = [
+  { key: 'bucket_start_time', label: 'Time'     },
+  { key: 'dbname',            label: 'DB'       },
+  { key: 'username',          label: 'User'     },
+  { key: 'query',             label: 'Query'    },
+  { key: 'calls',             label: 'Calls'    },
+  { key: 'total_ms',          label: 'Total ms' },
+  { key: 'mean_ms',           label: 'Mean ms'  },
+  { key: 'cpu_user_time',     label: 'CPU User' },
+  { key: 'cpu_sys_time',      label: 'CPU Sys'  },
+];
+
+function buildStatMonitorSection(instId, rows) {
+  const sort = statMonitorSort[instId] || { col: 'total_ms', dir: 'desc' };
+  const sorted = sortRows(rows, sort);
+
+  let h = '<div class="section-title">EDB Stat Monitor</div><div class="card"><div class="tbl-wrap">';
+  h += '<table><thead>';
+  h += sortableHeaderRow(STAT_MONITOR_COLS, sort, 'resortStatMonitor', instId);
+  h += '</thead><tbody>';
+  sorted.forEach(q => {
+    h += `<tr>
+      <td style="white-space:nowrap">${fmtDate(q.bucket_start_time)}</td>
+      <td>${escHtml(q.dbname||'')}</td><td>${escHtml(q.username||'')}</td>
+      <td><code style="font-size:11px">${escHtml(q.query||'')}</code></td>
+      <td>${fmtNum(q.calls)}</td><td>${fmtNum(q.total_ms)}</td><td>${fmtNum(q.mean_ms)}</td>
+      <td>${fmtNum(q.cpu_user_time)}</td><td>${fmtNum(q.cpu_sys_time)}</td>
+    </tr>`;
+  });
+  h += '</tbody></table></div></div>';
+  return h;
+}
+
+function resortStatMonitor(instId, col) {
+  const cur = statMonitorSort[instId] || { col: 'total_ms', dir: 'desc' };
+  const dir = (cur.col === col && cur.dir === 'desc') ? 'asc' : 'desc';
+  statMonitorSort[instId] = { col, dir };
+
+  const wrap = document.getElementById('statmon-wrap-' + instId);
+  const rows = (allData[instId] || {}).stat_monitor;
+  if (wrap && rows) wrap.innerHTML = buildStatMonitorSection(instId, rows);
+}
+
+// ============================================================
+// EDB Wait States — sortable table
+// ============================================================
+const waitStatesSort = {}; // instanceId -> {col, dir}
+
+const WAIT_STATES_COLS = [
+  { key: 'wait_type',  label: 'Type'  },
+  { key: 'wait_event', label: 'Event' },
+  { key: 'cnt',        label: 'Count' },
+];
+
+function buildWaitStatesTable(instId, rows) {
+  const sort = waitStatesSort[instId] || { col: 'cnt', dir: 'desc' };
+  const sorted = sortRows(rows, sort);
+
+  let h = '<div class="card"><div class="tbl-wrap"><table><thead>';
+  h += sortableHeaderRow(WAIT_STATES_COLS, sort, 'resortWaitStates', instId);
+  h += '</thead><tbody>';
+  sorted.forEach(w => {
+    h += `<tr><td>${escHtml(w.wait_type||'')}</td><td>${escHtml(w.wait_event||'')}</td><td>${w.cnt}</td></tr>`;
+  });
+  h += '</tbody></table></div></div>';
+  return h;
+}
+
+function resortWaitStates(instId, col) {
+  const cur = waitStatesSort[instId] || { col: 'cnt', dir: 'desc' };
+  const dir = (cur.col === col && cur.dir === 'desc') ? 'asc' : 'desc';
+  waitStatesSort[instId] = { col, dir };
+
+  const wrap = document.getElementById('waitstates-wrap-' + instId);
+  const rows = (allData[instId] || {}).wait_states;
+  if (wrap && rows) wrap.innerHTML = buildWaitStatesTable(instId, rows);
 }
 
 async function explainQuery(instId, queryid) {
@@ -1648,6 +1813,56 @@ async function explainQuery(instId, queryid) {
 
 function closeExplain() {
   document.getElementById('explain-overlay').classList.add('hidden');
+}
+
+async function showBenefitedQueries(instId, queryidsJson) {
+  const overlay = document.getElementById('benefited-overlay');
+  const body    = document.getElementById('benefited-body');
+  overlay.classList.remove('hidden');
+  body.textContent = 'Fetching queries…';
+
+  let queryids;
+  try {
+    queryids = JSON.parse(queryidsJson);
+  } catch (e) {
+    body.textContent = 'Error: could not read query list';
+    return;
+  }
+
+  try {
+    const r = await fetch(`/api/instances/${encodeURIComponent(instId)}/index-recommendation-queries`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ queryids }),
+    });
+    const data = await r.json();
+    if (!r.ok || data.error) {
+      body.textContent = 'Error: ' + (data.error || 'unknown error');
+      return;
+    }
+    const rows = data.queries || [];
+    if (!rows.length) {
+      body.innerHTML = '<p style="color:var(--muted)">None of these queries were found in pg_stat_statements — they may have aged out.</p>';
+      return;
+    }
+    let h = '<div class="tbl-wrap"><table><thead><tr>'
+      + '<th>Query</th><th>Calls</th><th>Total ms</th><th>Mean ms</th>'
+      + '</tr></thead><tbody>';
+    rows.forEach(q => {
+      h += `<tr>
+        <td><code style="font-size:11px;word-break:break-all">${escHtml(q.query||'')}</code></td>
+        <td>${fmtNum(q.calls)}</td><td>${fmtNum(q.total_ms)}</td><td>${fmtNum(q.mean_ms)}</td>
+      </tr>`;
+    });
+    h += '</tbody></table></div>';
+    body.innerHTML = h;
+  } catch (e) {
+    body.textContent = 'Error: ' + e.message;
+  }
+}
+
+function closeBenefitedQueries() {
+  document.getElementById('benefited-overlay').classList.add('hidden');
 }
 
 // ============================================================
@@ -1695,6 +1910,10 @@ const PALETTE = ['#4f8ef7','#22c55e','#f59e0b','#ef4444','#7c5cd8','#06b6d4','#e
 function upsertLine(cid, labels, data, label, color, yMin, yMax) {
   const canvas = document.getElementById(cid);
   if (!canvas) return;
+  if (charts[cid] && charts[cid].canvas !== canvas) {
+    charts[cid].destroy();
+    delete charts[cid];
+  }
   if (charts[cid]) {
     charts[cid].data.labels = labels;
     charts[cid].data.datasets[0].data = data;
@@ -1723,6 +1942,10 @@ function upsertLine(cid, labels, data, label, color, yMin, yMax) {
 function upsertPie(cid, labels, data) {
   const canvas = document.getElementById(cid);
   if (!canvas) return;
+  if (charts[cid] && charts[cid].canvas !== canvas) {
+    charts[cid].destroy();
+    delete charts[cid];
+  }
   if (charts[cid]) {
     charts[cid].data.labels = labels;
     charts[cid].data.datasets[0].data = data;
