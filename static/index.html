@@ -265,6 +265,15 @@ body {
 @media (max-width:1300px){ .grid-4 { grid-template-columns: repeat(2,1fr); } }
 @media (max-width: 900px){ .grid-4,.grid-3,.grid-2 { grid-template-columns: 1fr; } }
 
+/* Split stat card (e.g. Storage: Data | WAL), divided by a vertical rule */
+.card-split { display: flex; }
+.card-split > div:not(.card-split-divider) { flex: 1; min-width: 0; }
+.card-split-divider { flex: 0 0 1px; width: 1px; background: var(--border); margin: 2px 16px; }
+.card-split-label {
+  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .6px;
+  color: var(--muted); margin-bottom: 4px;
+}
+
 .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; box-shadow: var(--shadow-1); }
 .card-title { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .7px; color: var(--text); margin-bottom: 8px; }
 .card-value { font-size: 30px; font-weight: 700; color: var(--text); line-height: 1.15; }
@@ -1087,9 +1096,20 @@ function buildPanel(inst, d) {
 
   h += '<div class="grid-4" style="margin-top:14px">';
 
-  h += card('Total Data Size', `
-    <div class="card-value lg">${fmtBytes(totalSize)}</div>
-    <div class="card-sub">${(d.databases||[]).length} database(s)</div>`);
+  h += card('Storage', `
+    <div class="card-split">
+      <div>
+        <div class="card-split-label">Data</div>
+        <div class="card-value lg">${fmtBytes(totalSize)}</div>
+        <div class="card-sub">${(d.databases||[]).length} database(s)</div>
+      </div>
+      <div class="card-split-divider"></div>
+      <div>
+        <div class="card-split-label">WAL</div>
+        <div class="card-value lg">${d.wal_bytes_on_disk != null ? fmtBytes(d.wal_bytes_on_disk) : '—'}</div>
+        <div class="card-sub">pg_wal directory</div>
+      </div>
+    </div>`);
 
   h += card('Checkpoints', `
     <div class="card-value lg">${(bgw.checkpoints_timed||0)+(bgw.checkpoints_req||0)}</div>

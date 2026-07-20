@@ -287,12 +287,14 @@ def collect_instance(inst):
             ORDER BY cnt DESC LIMIT 20
         """)
 
-        # --- WAL -----------------------------------------------------------
+        # --- WAL -------------------------------------------------------------
+        # Actual on-disk size of the pg_wal directory (not the cumulative LSN
+        # offset, which only ever grows and doesn't reflect recycled segments).
         try:
-            wal = scalar(conn, "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')")
-            result["wal_bytes_total"] = int(wal) if wal else 0
+            wal = scalar(conn, "SELECT COALESCE(SUM(size), 0) FROM pg_ls_waldir()")
+            result["wal_bytes_on_disk"] = int(wal)
         except Exception:
-            result["wal_bytes_total"] = None
+            result["wal_bytes_on_disk"] = None
 
         # --- pg_stat_statements -------------------------------------------
         try:
