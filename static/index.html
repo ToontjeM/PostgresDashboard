@@ -1,0 +1,1201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PostgreSQL Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<style>
+/* ============================================================
+   Design tokens
+   ============================================================ */
+:root {
+  --bg:        #0f1117;
+  --surface:   #161820;
+  --card:      #1e2130;
+  --border:    #2a2e42;
+  --accent:    #4f8ef7;
+  --accent2:   #7c5cd8;
+  --green:     #22c55e;
+  --amber:     #f59e0b;
+  --red:       #ef4444;
+  --muted:     #6b7280;
+  --text:      #e5e7eb;
+  --text2:     #9ca3af;
+  --sidebar-w: 240px;
+  --header-h:  52px;
+  --font: -apple-system, "Segoe UI", system-ui, sans-serif;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: var(--font); font-size: 14px; line-height: 1.5; height: 100vh; overflow: hidden; }
+
+/* ============================================================
+   Shell
+   ============================================================ */
+#shell { display: flex; flex-direction: column; height: 100vh; }
+
+/* --- Top header --- */
+#topbar {
+  height: var(--header-h); flex-shrink: 0;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 20px; background: var(--surface);
+  border-bottom: 1px solid var(--border); z-index: 50;
+}
+#topbar h1 { font-size: 17px; font-weight: 700; letter-spacing: .2px; }
+#topbar h1 span { color: var(--accent); }
+#topbar-right { display: flex; align-items: center; gap: 14px; }
+#refresh-info { font-size: 12px; color: var(--muted); }
+.btn {
+  padding: 5px 13px; border-radius: 6px; border: 1px solid var(--border);
+  background: var(--card); color: var(--text2); cursor: pointer; font-size: 12px;
+  font-family: var(--font); transition: border-color .15s, color .15s;
+}
+.btn:hover { border-color: var(--accent); color: var(--accent); }
+.btn-primary { border-color: var(--accent); color: var(--accent); }
+.btn-primary:hover { background: rgba(79,142,247,.12); }
+.btn-danger  { border-color: var(--red);    color: var(--red); }
+.btn-danger:hover  { background: rgba(239,68,68,.12); }
+
+/* --- Body row (sidebar + content) --- */
+#body-row { display: flex; flex: 1; overflow: hidden; }
+
+/* ============================================================
+   Sidebar
+   ============================================================ */
+#sidebar {
+  width: var(--sidebar-w); flex-shrink: 0;
+  background: var(--surface); border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; overflow: hidden;
+}
+
+#sidebar-header {
+  padding: 14px 14px 10px; border-bottom: 1px solid var(--border); flex-shrink: 0;
+  display: flex; align-items: center; justify-content: space-between;
+}
+#sidebar-header span { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .8px; color: var(--muted); }
+
+#instance-list { flex: 1; overflow-y: auto; padding: 6px 0; }
+
+.inst-item {
+  display: flex; align-items: center; gap: 0;
+  padding: 0 6px 0 12px; height: 44px; cursor: pointer;
+  border-left: 3px solid transparent;
+  transition: background .12s;
+  position: relative;
+}
+.inst-item:hover { background: rgba(255,255,255,.04); }
+.inst-item.active {
+  background: rgba(79,142,247,.08);
+  border-left-color: var(--accent);
+}
+.inst-item.active .inst-name { color: var(--accent); }
+.inst-dot {
+  width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+  margin-right: 9px; background: var(--muted);
+  transition: background .3s;
+}
+.inst-dot.ok  { background: var(--green); }
+.inst-dot.err { background: var(--red); }
+.inst-dot.loading { background: var(--amber); animation: pulse 1s ease-in-out infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+.inst-info { flex: 1; min-width: 0; }
+.inst-name { font-size: 13px; font-weight: 500; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.inst-meta { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.inst-del {
+  opacity: 0; padding: 4px 6px; border-radius: 4px; color: var(--muted);
+  background: none; border: none; cursor: pointer; font-size: 14px; line-height: 1;
+  transition: opacity .15s, color .15s;
+}
+.inst-item:hover .inst-del { opacity: 1; }
+.inst-del:hover { color: var(--red); }
+
+/* Instance form panel — always visible at the bottom of the sidebar */
+#inst-form-panel {
+  border-top: 1px solid var(--border); flex-shrink: 0;
+  padding: 10px 10px 12px; display: flex; flex-direction: column; gap: 6px;
+}
+#inst-form-title {
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .7px;
+  color: var(--muted); margin-bottom: 2px;
+  display: flex; align-items: center; justify-content: space-between;
+}
+#inst-form-title .new-btn {
+  font-size: 11px; color: var(--accent); cursor: pointer; background: none;
+  border: none; font-family: var(--font); font-weight: 600; padding: 0;
+}
+#inst-form-title .new-btn:hover { text-decoration: underline; }
+#inst-form-panel input {
+  width: 100%; padding: 6px 8px; background: var(--bg);
+  border: 1px solid var(--border); border-radius: 5px;
+  color: var(--text); font-family: var(--font); font-size: 12px;
+  outline: none; transition: border-color .15s;
+}
+#inst-form-panel input:focus { border-color: var(--accent); }
+#inst-form-panel input::placeholder { color: var(--muted); }
+.form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
+#inst-form-error { color: var(--red); font-size: 11px; min-height: 14px; }
+.form-btns { display: flex; gap: 5px; }
+.form-btns button {
+  flex: 1; padding: 7px 4px; border: none; border-radius: 5px;
+  font-family: var(--font); font-size: 12px; font-weight: 600;
+  cursor: pointer; transition: opacity .15s;
+}
+.form-btns button:disabled { opacity: .5; cursor: not-allowed; }
+#inst-form-save   { background: var(--accent); color: #fff; }
+#inst-form-delete { background: rgba(239,68,68,.15); color: var(--red); flex: 0 0 auto; padding: 7px 10px; }
+#inst-form-save:hover   { opacity: .85; }
+#inst-form-delete:hover { background: rgba(239,68,68,.28); }
+
+/* ============================================================
+   Content area
+   ============================================================ */
+#content { flex: 1; overflow-y: auto; padding: 20px 24px; }
+#content::-webkit-scrollbar { width: 6px; }
+#content::-webkit-scrollbar-track { background: transparent; }
+#content::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+/* ============================================================
+   Cards & grids
+   ============================================================ */
+.section-title {
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px;
+  color: var(--muted); margin: 24px 0 10px; padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+.grid-4 { display: grid; grid-template-columns: repeat(4,1fr); gap: 14px; }
+.grid-3 { display: grid; grid-template-columns: repeat(3,1fr); gap: 14px; }
+.grid-2 { display: grid; grid-template-columns: repeat(2,1fr); gap: 14px; }
+@media (max-width:1300px){ .grid-4 { grid-template-columns: repeat(2,1fr); } }
+@media (max-width: 900px){ .grid-4,.grid-3,.grid-2 { grid-template-columns: 1fr; } }
+
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+.card-title { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .7px; color: var(--muted); margin-bottom: 8px; }
+.card-value { font-size: 30px; font-weight: 700; color: var(--text); line-height: 1.15; }
+.card-value.lg { font-size: 24px; }
+.card-value.green { color: var(--green); }
+.card-value.amber { color: var(--amber); }
+.card-value.red   { color: var(--red);   }
+.card-sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
+
+.chart-card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+.chart-title { font-size: 12px; font-weight: 600; color: var(--text2); margin-bottom: 10px; }
+.chart-card canvas { max-height: 180px; }
+
+/* Progress bar */
+.progress-wrap { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.progress-bar  { flex:1; height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; }
+.progress-fill { height: 100%; border-radius: 3px; transition: width .4s; }
+.progress-pct  { font-size: 11px; color: var(--text2); min-width: 30px; text-align: right; }
+
+/* Badge */
+.badge { display:inline-block; padding:2px 7px; border-radius:4px; font-size:11px; font-weight:600; }
+.badge-green { background:rgba(34,197,94,.14);  color:var(--green); }
+.badge-red   { background:rgba(239,68,68,.14);  color:var(--red);   }
+.badge-amber { background:rgba(245,158,11,.14); color:var(--amber); }
+.badge-blue  { background:rgba(79,142,247,.14); color:var(--accent);}
+
+/* Tables */
+.tbl-wrap { overflow-x: auto; }
+table { width:100%; border-collapse:collapse; font-size:12px; }
+th { text-align:left; padding:7px 10px; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:.5px; border-bottom:1px solid var(--border); white-space:nowrap; }
+td { padding:6px 10px; border-bottom:1px solid rgba(255,255,255,.04); color:var(--text); vertical-align:top; }
+tr:hover td { background:rgba(255,255,255,.025); }
+
+/* KV list */
+.kv-list { display:grid; grid-template-columns:auto 1fr; gap:4px 12px; }
+.kv-key  { color:var(--muted); font-size:12px; white-space:nowrap; }
+.kv-val  { color:var(--text);  font-size:12px; font-weight:500; }
+
+/* Error panel */
+.error-panel { padding:16px; border-radius:10px; background:rgba(239,68,68,.08); border:1px solid rgba(239,68,68,.3); color:var(--red); font-size:13px; margin-top:6px; }
+.error-panel pre { margin-top:8px; font-size:11px; white-space:pre-wrap; color:inherit; opacity:.7; }
+
+/* Empty state */
+.empty-state { text-align:center; padding:80px 20px; color:var(--muted); }
+.empty-state h2 { font-size:18px; margin-bottom:8px; color:var(--text2); }
+
+/* Loading spinner */
+#global-loading {
+  position:fixed; inset:0; background:rgba(15,17,23,.88);
+  display:flex; align-items:center; justify-content:center;
+  font-size:16px; color:var(--accent); z-index:999; gap:12px;
+}
+#global-loading.hidden { display:none; }
+.spinner { width:28px; height:28px; border:3px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin .7s linear infinite; flex-shrink:0; }
+@keyframes spin { to { transform:rotate(360deg); } }
+
+/* Confirm overlay */
+#confirm-overlay {
+  position:fixed; inset:0; background:rgba(0,0,0,.6);
+  display:flex; align-items:center; justify-content:center; z-index:200;
+}
+#confirm-overlay.hidden { display:none; }
+#confirm-box {
+  background:var(--card); border:1px solid var(--border); border-radius:12px;
+  padding:24px; max-width:360px; width:90%; text-align:center;
+}
+#confirm-box h3 { font-size:16px; margin-bottom:8px; }
+#confirm-box p  { font-size:13px; color:var(--text2); margin-bottom:20px; }
+#confirm-box .btns { display:flex; gap:10px; justify-content:center; }
+</style>
+</head>
+<body>
+
+<div id="global-loading"><div class="spinner"></div>Connecting to instances…</div>
+
+<!-- Confirm dialog -->
+<div id="confirm-overlay" class="hidden">
+  <div id="confirm-box">
+    <h3 id="confirm-title">Remove Instance?</h3>
+    <p  id="confirm-body">This cannot be undone.</p>
+    <div class="btns">
+      <button class="btn" id="confirm-cancel">Cancel</button>
+      <button class="btn btn-danger" id="confirm-ok">Remove</button>
+    </div>
+  </div>
+</div>
+
+<div id="shell">
+  <!-- Top bar -->
+  <div id="topbar">
+    <h1>Postgres<span>Dashboard</span></h1>
+    <div id="topbar-right">
+      <span id="refresh-info">Loading…</span>
+      <button class="btn btn-primary" onclick="manualRefresh()">↻ Refresh now</button>
+    </div>
+  </div>
+
+  <!-- Body -->
+  <div id="body-row">
+
+    <!-- Sidebar -->
+    <div id="sidebar">
+      <div id="sidebar-header">
+        <span>Instances</span>
+      </div>
+
+      <div id="instance-list"><!-- built by JS --></div>
+
+      <!-- Always-visible instance form -->
+      <div id="inst-form-panel">
+        <div id="inst-form-title">
+          <span id="inst-form-heading">New Instance</span>
+          <button class="new-btn" id="inst-form-new-btn" onclick="formNew()" style="display:none">+ New</button>
+        </div>
+        <input id="f-label"    placeholder="Label (optional)" />
+        <div class="form-row">
+          <input id="f-host"   placeholder="Host *" value="localhost" />
+          <input id="f-port"   placeholder="Port *" type="number" value="5432" />
+        </div>
+        <input id="f-dbname"   placeholder="Database *" value="postgres" />
+        <input id="f-user"     placeholder="Username *" value="postgres" />
+        <input id="f-password" placeholder="Password *" type="password" value="postgres" />
+        <div id="inst-form-error"></div>
+        <div class="form-btns">
+          <button id="inst-form-save"   onclick="formSave()">Add</button>
+          <button id="inst-form-delete" onclick="formDelete()" style="display:none" title="Remove instance">&#x1f5d1;</button>
+        </div>
+      </div>
+    </div><!-- /sidebar -->
+
+    <!-- Main content -->
+    <div id="content">
+      <div id="panel-content"><!-- built by JS --></div>
+    </div>
+
+  </div><!-- /body-row -->
+</div><!-- /shell -->
+
+<script>
+'use strict';
+// ============================================================
+// State
+// ============================================================
+let allData      = {};          // instanceId → metrics object
+let instances    = [];          // ordered list from /api/instances
+let activeId     = null;
+let charts       = {};          // canvasId → Chart instance
+let histBuf      = {};          // instanceId → {tps,conn,cache,ts}[]
+let formMode     = 'new';       // 'new' | 'edit'
+let formEditId   = null;        // id being edited
+
+const MAX_HIST   = 20;
+let autoTimer    = null;
+
+// ============================================================
+// Boot
+// ============================================================
+(async function boot() {
+  await loadInstances();
+  await fetchMetrics();
+  // Pre-load the active instance into the form
+  const first = instances.find(i => i.id === activeId);
+  if (first) formEdit(first); else formNew();
+  document.getElementById('global-loading').classList.add('hidden');
+  startAutoRefresh();
+})();
+
+// ============================================================
+// Data fetching
+// ============================================================
+async function loadInstances() {
+  try {
+    const r  = await fetch('/api/instances');
+    instances = await r.json();
+    if (!activeId && instances.length) activeId = instances[0].id;
+  } catch(e) {
+    console.error('loadInstances', e);
+  }
+}
+
+async function fetchMetrics() {
+  try {
+    const r  = await fetch('/api/metrics');
+    allData  = await r.json();
+    document.getElementById('refresh-info').textContent =
+      'Updated ' + new Date().toLocaleTimeString();
+    renderSidebar();
+    renderContent();
+  } catch(e) {
+    document.getElementById('refresh-info').textContent = 'Error: ' + e.message;
+  }
+}
+
+function startAutoRefresh() {
+  if (autoTimer) clearInterval(autoTimer);
+  autoTimer = setInterval(fetchMetrics, 10000);
+}
+function manualRefresh() { fetchMetrics(); }
+
+// ============================================================
+// Instance form — shared for Add + Edit
+// ============================================================
+
+// Switch form to "new instance" mode and clear fields
+function formNew() {
+  formMode   = 'new';
+  formEditId = null;
+  document.getElementById('inst-form-heading').textContent = 'New Instance';
+  document.getElementById('inst-form-new-btn').style.display = 'none';
+  document.getElementById('inst-form-delete').style.display  = 'none';
+  document.getElementById('inst-form-save').textContent      = 'Add';
+  document.getElementById('inst-form-error').textContent     = '';
+  setv('f-label', '');
+  setv('f-host',  'localhost');
+  setv('f-port',  '5432');
+  setv('f-dbname','postgres');
+  setv('f-user',  'postgres');
+  setv('f-password', '');
+}
+
+// Switch form to "edit" mode, pre-filling from an instance object
+function formEdit(inst) {
+  formMode   = 'edit';
+  formEditId = inst.id;
+  document.getElementById('inst-form-heading').textContent   = 'Edit Instance';
+  document.getElementById('inst-form-new-btn').style.display = 'inline';
+  document.getElementById('inst-form-delete').style.display  = 'inline-flex';
+  document.getElementById('inst-form-save').textContent      = 'Save';
+  document.getElementById('inst-form-error').textContent     = '';
+  setv('f-label',    inst.label  || '');
+  setv('f-host',     inst.host   || 'localhost');
+  setv('f-port',     inst.port   || '5432');
+  setv('f-dbname',   inst.dbname || 'postgres');
+  setv('f-user',     inst.user   || 'postgres');
+  setv('f-password', inst.password || '');
+}
+
+// Save button — dispatches to add or update
+async function formSave() {
+  if (formMode === 'new') {
+    await doAddInstance();
+  } else {
+    await doUpdateInstance(formEditId);
+  }
+}
+
+async function doAddInstance() {
+  const saveBtn = document.getElementById('inst-form-save');
+  const errEl   = document.getElementById('inst-form-error');
+  const payload = readFormFields();
+  if (!payload) return;
+
+  saveBtn.disabled    = true;
+  saveBtn.textContent = 'Connecting…';
+  errEl.textContent   = '';
+  try {
+    const r    = await fetch('/api/instances', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const data = await r.json();
+    if (!r.ok) { errEl.textContent = data.error || 'Failed'; return; }
+    await loadInstances();
+    activeId = data.id;
+    formEdit(instances.find(i => i.id === activeId) || data);
+    await fetchMetrics();
+  } catch(e) {
+    errEl.textContent = e.message;
+  } finally {
+    saveBtn.disabled    = false;
+    saveBtn.textContent = 'Add';
+  }
+}
+
+async function doUpdateInstance(id) {
+  const saveBtn = document.getElementById('inst-form-save');
+  const errEl   = document.getElementById('inst-form-error');
+  const payload = readFormFields();
+  if (!payload) return;
+
+  saveBtn.disabled    = true;
+  saveBtn.textContent = 'Saving…';
+  errEl.textContent   = '';
+  try {
+    const r    = await fetch('/api/instances/' + id, {
+      method: 'PUT', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const data = await r.json();
+    if (!r.ok) { errEl.textContent = data.error || 'Failed'; return; }
+    await loadInstances();
+    // Stay in edit mode with fresh data
+    formEdit(instances.find(i => i.id === id) || data);
+    await fetchMetrics();
+  } catch(e) {
+    errEl.textContent = e.message;
+  } finally {
+    saveBtn.disabled    = false;
+    saveBtn.textContent = 'Save';
+  }
+}
+
+// Delete button inside form
+function formDelete() {
+  if (!formEditId) return;
+  const inst = instances.find(i => i.id === formEditId);
+  const lbl  = inst ? inst.label : formEditId;
+  const overlay = document.getElementById('confirm-overlay');
+  document.getElementById('confirm-title').textContent = 'Remove "' + lbl + '"?';
+  document.getElementById('confirm-body').textContent  =
+    'This removes the instance from the dashboard. Your Postgres data is untouched.';
+  document.getElementById('confirm-cancel').onclick = () => overlay.classList.add('hidden');
+  document.getElementById('confirm-ok').onclick     = async () => {
+    overlay.classList.add('hidden');
+    await doRemoveInstance(formEditId);
+  };
+  overlay.classList.remove('hidden');
+}
+
+async function doRemoveInstance(id) {
+  await fetch('/api/instances/' + id, {method: 'DELETE'});
+  delete allData[id];
+  delete histBuf[id];
+  Object.keys(charts).filter(k => k.includes(id)).forEach(k => {
+    charts[k].destroy(); delete charts[k];
+  });
+  if (activeId === id) activeId = null;
+  await loadInstances();
+  if (!activeId && instances.length) activeId = instances[0].id;
+  // After delete, switch form to the now-active instance (or new-mode if none)
+  const next = instances.find(i => i.id === activeId);
+  if (next) formEdit(next); else formNew();
+  renderSidebar();
+  renderContent();
+}
+
+// Read and validate the form fields; returns payload or null
+function readFormFields() {
+  const host   = v('f-host').trim();
+  const port   = v('f-port').trim();
+  const dbname = v('f-dbname').trim();
+  const user   = v('f-user').trim();
+  if (!host || !port || !dbname || !user) {
+    document.getElementById('inst-form-error').textContent =
+      'Host, port, database and username are required.';
+    return null;
+  }
+  return {
+    label:    v('f-label').trim(),
+    host, port, dbname, user,
+    password: v('f-password'),
+  };
+}
+
+// ============================================================
+// Sidebar render
+// ============================================================
+function renderSidebar() {
+  const list = document.getElementById('instance-list');
+  list.innerHTML = '';
+  instances.forEach(inst => {
+    const d    = allData[inst.id] || {};
+    const ok   = !d.error;
+    const dot  = d.collected_at ? (ok ? 'ok' : 'err') : 'loading';
+    const ver  = d.pg_version_short ? 'PG ' + d.pg_version_short.split(' ')[0] : '…';
+    const meta = `${inst.host}:${inst.port} · ${ver}`;
+
+    const item = document.createElement('div');
+    item.className = 'inst-item' + (activeId === inst.id ? ' active' : '');
+    item.onclick   = () => {
+      activeId = inst.id;
+      formEdit(inst);           // load this instance into the form
+      renderSidebar();
+      renderContent();
+    };
+    item.innerHTML = `
+      <span class="inst-dot ${dot}"></span>
+      <div class="inst-info">
+        <div class="inst-name">${escHtml(inst.label)}</div>
+        <div class="inst-meta">${escHtml(meta)}</div>
+      </div>
+    `;
+    list.appendChild(item);
+  });
+}
+
+// ============================================================
+// Content render
+// ============================================================
+function renderContent() {
+  const panel = document.getElementById('panel-content');
+
+  if (!instances.length) {
+    panel.innerHTML = `<div class="empty-state">
+      <h2>No instances configured</h2>
+      <p>Use <strong>+ Add instance</strong> in the sidebar to connect to a PostgreSQL server.</p>
+    </div>`;
+    return;
+  }
+
+  if (!activeId) activeId = instances[0].id;
+  const inst = instances.find(i => i.id === activeId);
+  if (!inst) return;
+
+  const d = allData[inst.id];
+  if (!d) {
+    panel.innerHTML = '<div class="empty-state"><h2>Loading…</h2></div>';
+    return;
+  }
+  if (d.error) {
+    panel.innerHTML = `<div class="error-panel">
+      <strong>&#x26A0; Connection error</strong> — ${escHtml(d.error)}
+      <pre>${escHtml(d.traceback || '')}</pre>
+    </div>`;
+    return;
+  }
+
+  panel.innerHTML = buildPanel(inst, d);
+  pushHistory(inst.id, d);
+  drawCharts(inst.id, d);
+}
+
+// ============================================================
+// Panel builder
+// ============================================================
+function buildPanel(inst, d) {
+  const c          = d.connections || {};
+  const connPct    = c.max_connections ? Math.round(100 * c.total / c.max_connections) : 0;
+  const cc         = connPct > 80 ? 'red' : connPct > 60 ? 'amber' : 'green';
+  const uptimeStr  = fmtUptime(d.uptime_seconds || 0);
+  const cacheHit   = avgCacheHit(d.databases || []);
+  const chColor    = cacheHit < 90 ? 'amber' : 'green';
+  const totalSize  = (d.databases || []).reduce((s, db) => s + parseInt(db.size_bytes || 0), 0);
+  const bgw        = d.bgwriter || {};
+  const deadlocks  = (d.databases || []).reduce((s, db) => s + (db.deadlocks || 0), 0);
+  const longCnt    = (d.long_queries || []).length;
+
+  let h = '';
+
+  // ── system_stats ─────────────────────────────────────────────
+  h += buildSystemStatsPanel(d.system_stats);
+
+  // ── pg_tuner ─────────────────────────────────────────────────
+  h += buildPgTunerPanel(d.pg_tuner);
+
+  // ── Overview cards ──────────────────────────────────────────
+  h += '<div class="section-title">Overview</div><div class="grid-4">';
+
+  h += card('Version', `
+    <div class="card-value lg">${escHtml(d.pg_version_short || '—')}</div>
+    <div class="card-sub">Uptime: ${uptimeStr}</div>
+    <div class="card-sub" style="margin-top:2px">${d.server_start ? 'Since ' + fmtDate(d.server_start) : ''}</div>`);
+
+  h += card('Connections', `
+    <div class="card-value ${cc}">${c.total || 0}</div>
+    <div class="card-sub">of ${c.max_connections || '?'} max</div>
+    <div class="progress-wrap">
+      <div class="progress-bar"><div class="progress-fill" style="width:${connPct}%;background:var(--${cc})"></div></div>
+      <span class="progress-pct">${connPct}%</span>
+    </div>
+    <div class="card-sub" style="margin-top:7px;font-size:11px">
+      Active <b>${c.active||0}</b> &nbsp; Idle <b>${c.idle||0}</b> &nbsp;
+      IdleTxn <b style="${(c.idle_in_txn||0)>0?'color:var(--amber)':''}">${c.idle_in_txn||0}</b> &nbsp;
+      Waiting <b>${c.waiting||0}</b>
+    </div>`);
+
+  h += card('TPS (avg since reset)', `
+    <div class="card-value">${fmtNum(d.tps)}</div>
+    <div class="card-sub">transactions / second</div>`);
+
+  h += card('Cache Hit Ratio', `
+    <div class="card-value ${chColor}">${cacheHit}%</div>
+    <div class="card-sub">avg across databases</div>
+    <div class="progress-wrap">
+      <div class="progress-bar"><div class="progress-fill" style="width:${cacheHit}%;background:var(--${chColor})"></div></div>
+      <span class="progress-pct">${cacheHit}%</span>
+    </div>`);
+
+  h += '</div>';
+
+  h += '<div class="grid-4" style="margin-top:14px">';
+
+  h += card('Total Data Size', `
+    <div class="card-value lg">${fmtBytes(totalSize)}</div>
+    <div class="card-sub">${(d.databases||[]).length} database(s)</div>`);
+
+  h += card('Checkpoints', `
+    <div class="card-value lg">${(bgw.checkpoints_timed||0)+(bgw.checkpoints_req||0)}</div>
+    <div class="card-sub">Timed: ${bgw.checkpoints_timed||0} · Requested: ${bgw.checkpoints_req||0}</div>
+    <div class="card-sub">Written: ${bgw.chk_written||'—'}</div>`);
+
+  h += card('Deadlocks', `
+    <div class="card-value ${deadlocks>0?'red':'green'}">${deadlocks}</div>
+    <div class="card-sub">total across all databases</div>`);
+
+  h += card('Long Queries (&gt;1 s)', `
+    <div class="card-value ${longCnt>5?'red':longCnt>0?'amber':'green'}">${longCnt}</div>
+    <div class="card-sub">currently running</div>`);
+
+  h += '</div>';
+
+  // ── Trend sparklines ─────────────────────────────────────────
+  h += '<div class="section-title">Trend (last ' + MAX_HIST + ' samples · 10 s intervals)</div>';
+  h += '<div class="grid-3">';
+  h += `<div class="chart-card"><div class="chart-title">Transactions / Second</div><canvas id="c-tps-${inst.id}"></canvas></div>`;
+  h += `<div class="chart-card"><div class="chart-title">Active Connections</div><canvas id="c-conn-${inst.id}"></canvas></div>`;
+  h += `<div class="chart-card"><div class="chart-title">Cache Hit Ratio (%)</div><canvas id="c-cache-${inst.id}"></canvas></div>`;
+  h += '</div>';
+
+  // ── Databases ────────────────────────────────────────────────
+  h += '<div class="section-title">Databases</div><div class="card"><div class="tbl-wrap">';
+  h += `<table><thead><tr>
+    <th>Database</th><th>Size</th><th>Backends</th><th>Cache Hit</th>
+    <th>Commits</th><th>Rollbacks</th><th>Inserts</th><th>Updates</th><th>Deletes</th>
+    <th>Deadlocks</th><th>Temp Files</th>
+  </tr></thead><tbody>`;
+  (d.databases || []).forEach(db => {
+    const ch = db.cache_hit_ratio;
+    const cs = ch === null ? '' : ch < 90 ? 'color:var(--amber)' : 'color:var(--green)';
+    h += `<tr>
+      <td><b>${escHtml(db.datname)}</b></td>
+      <td>${escHtml(db.size_pretty)}</td>
+      <td>${db.numbackends}</td>
+      <td style="${cs}">${ch===null?'—':ch+'%'}</td>
+      <td>${fmtNum(db.xact_commit)}</td>
+      <td style="${(db.xact_rollback||0)>0?'color:var(--amber)':''}">${fmtNum(db.xact_rollback)}</td>
+      <td>${fmtNum(db.tup_inserted)}</td><td>${fmtNum(db.tup_updated)}</td><td>${fmtNum(db.tup_deleted)}</td>
+      <td style="${(db.deadlocks||0)>0?'color:var(--red)':''}">${db.deadlocks||0}</td>
+      <td>${db.temp_files||0} (${db.temp_bytes_pretty||'0 bytes'})</td>
+    </tr>`;
+  });
+  h += '</tbody></table></div></div>';
+
+  // ── Long queries ─────────────────────────────────────────────
+  h += '<div class="section-title">Long-Running Queries</div><div class="card"><div class="tbl-wrap">';
+  if (!(d.long_queries||[]).length) {
+    h += '<p style="color:var(--muted);padding:6px">None at this time.</p>';
+  } else {
+    h += `<table><thead><tr>
+      <th>PID</th><th>User</th><th>DB</th><th>State</th><th>Duration</th><th>Wait</th><th>Query</th>
+    </tr></thead><tbody>`;
+    (d.long_queries||[]).forEach(q => {
+      const dur = q.duration_s;
+      h += `<tr>
+        <td>${q.pid}</td><td>${escHtml(q.usename||'')}</td><td>${escHtml(q.datname||'')}</td>
+        <td><span class="badge ${stateClass(q.state)}">${escHtml(q.state||'')}</span></td>
+        <td style="${dur>60?'color:var(--red)':dur>10?'color:var(--amber)':''}">${dur}s</td>
+        <td>${escHtml((q.wait_event_type||'')+(q.wait_event?' / '+q.wait_event:''))}</td>
+        <td><code style="font-size:11px;word-break:break-all">${escHtml(q.query||'')}</code></td>
+      </tr>`;
+    });
+    h += '</tbody></table>';
+  }
+  h += '</div></div>';
+
+  // ── Top queries ──────────────────────────────────────────────
+  if ((d.top_queries||[]).length) {
+    h += '<div class="section-title">Top Queries by Total Execution Time (pg_stat_statements)</div>';
+    h += '<div class="card"><div class="tbl-wrap">';
+    h += `<table><thead><tr><th>Query</th><th>Calls</th><th>Total ms</th><th>Mean ms</th><th>Stddev ms</th><th>Rows</th></tr></thead><tbody>`;
+    d.top_queries.forEach(q => {
+      h += `<tr>
+        <td><code style="font-size:11px;word-break:break-all">${escHtml(q.query)}</code></td>
+        <td>${fmtNum(q.calls)}</td><td>${fmtNum(q.total_ms)}</td>
+        <td>${fmtNum(q.mean_ms)}</td><td>${fmtNum(q.stddev_ms)}</td><td>${fmtNum(q.rows)}</td>
+      </tr>`;
+    });
+    h += '</tbody></table></div></div>';
+  }
+
+  // ── EDB stat monitor ─────────────────────────────────────────
+  if ((d.stat_monitor||[]).length) {
+    h += '<div class="section-title">EDB Stat Monitor</div><div class="card"><div class="tbl-wrap">';
+    h += `<table><thead><tr><th>Time</th><th>DB</th><th>User</th><th>Query</th><th>Calls</th><th>Total ms</th><th>Mean ms</th><th>CPU User</th><th>CPU Sys</th></tr></thead><tbody>`;
+    d.stat_monitor.forEach(q => {
+      h += `<tr>
+        <td style="white-space:nowrap">${fmtDate(q.bucket_start_time)}</td>
+        <td>${escHtml(q.dbname||'')}</td><td>${escHtml(q.username||'')}</td>
+        <td><code style="font-size:11px">${escHtml(q.query||'')}</code></td>
+        <td>${fmtNum(q.calls)}</td><td>${fmtNum(q.total_ms)}</td><td>${fmtNum(q.mean_ms)}</td>
+        <td>${fmtNum(q.cpu_user_time)}</td><td>${fmtNum(q.cpu_sys_time)}</td>
+      </tr>`;
+    });
+    h += '</tbody></table></div></div>';
+  }
+
+  // ── Wait states ──────────────────────────────────────────────
+  if ((d.wait_states||[]).length) {
+    h += '<div class="section-title">EDB Wait States</div><div class="grid-2">';
+    h += '<div class="card"><div class="tbl-wrap">';
+    h += `<table><thead><tr><th>Type</th><th>Event</th><th>Count</th></tr></thead><tbody>`;
+    d.wait_states.forEach(w => {
+      h += `<tr><td>${escHtml(w.wait_type||'')}</td><td>${escHtml(w.wait_event||'')}</td><td>${w.cnt}</td></tr>`;
+    });
+    h += '</tbody></table></div></div>';
+    h += `<div class="chart-card"><div class="chart-title">Wait Event Distribution</div><canvas id="c-wait-${inst.id}"></canvas></div>`;
+    h += '</div>';
+  }
+
+  // ── Bloat / vacuum ───────────────────────────────────────────
+  if ((d.bloat_tables||[]).length) {
+    h += '<div class="section-title">Table Bloat &amp; Vacuum (top 10 by dead tuples)</div>';
+    h += '<div class="card"><div class="tbl-wrap">';
+    h += `<table><thead><tr>
+      <th>Schema</th><th>Table</th><th>Live</th><th>Dead</th><th>Dead %</th>
+      <th>Last Vacuum</th><th>Last Autovacuum</th><th>Last Analyze</th><th>Last Autoanalyze</th>
+    </tr></thead><tbody>`;
+    d.bloat_tables.forEach(t => {
+      const dr = parseFloat(t.dead_ratio||0);
+      h += `<tr>
+        <td>${escHtml(t.schemaname)}</td><td>${escHtml(t.relname)}</td>
+        <td>${fmtNum(t.n_live_tup)}</td><td>${fmtNum(t.n_dead_tup)}</td>
+        <td style="${dr>20?'color:var(--red)':dr>10?'color:var(--amber)':''}">${dr}%</td>
+        <td>${fmtDate(t.last_vacuum)}</td><td>${fmtDate(t.last_autovacuum)}</td>
+        <td>${fmtDate(t.last_analyze)}</td><td>${fmtDate(t.last_autoanalyze)}</td>
+      </tr>`;
+    });
+    h += '</tbody></table></div></div>';
+  }
+
+  // ── Locks ────────────────────────────────────────────────────
+  h += '<div class="section-title">Locks Summary</div><div class="card"><div class="tbl-wrap">';
+  h += `<table><thead><tr><th>Type</th><th>Mode</th><th>Granted</th><th>Count</th></tr></thead><tbody>`;
+  (d.locks||[]).forEach(l => {
+    h += `<tr>
+      <td>${escHtml(l.locktype)}</td><td>${escHtml(l.mode)}</td>
+      <td><span class="badge ${l.granted?'badge-green':'badge-red'}">${l.granted?'Yes':'No'}</span></td>
+      <td>${l.cnt}</td>
+    </tr>`;
+  });
+  h += '</tbody></table></div></div>';
+
+  // ── Replication ──────────────────────────────────────────────
+  h += '<div class="section-title">Replication</div><div class="card">';
+  if (!(d.replication||[]).length) {
+    h += '<p style="color:var(--muted);padding:4px">No standbys connected.</p>';
+  } else {
+    h += '<div class="tbl-wrap"><table><thead><tr><th>Client</th><th>State</th><th>Sent LSN</th><th>Replay LSN</th><th>Lag</th></tr></thead><tbody>';
+    d.replication.forEach(r => {
+      h += `<tr>
+        <td>${escHtml(r.client_addr||'')}</td><td>${escHtml(r.state||'')}</td>
+        <td>${escHtml(r.sent_lsn||'')}</td><td>${escHtml(r.replay_lsn||'')}</td>
+        <td>${r.replay_lag_bytes!=null?fmtBytes(r.replay_lag_bytes):'—'}</td>
+      </tr>`;
+    });
+    h += '</tbody></table></div>';
+  }
+  h += '</div>';
+
+  // ── Tablespaces ──────────────────────────────────────────────
+  h += '<div class="section-title">Tablespaces</div><div class="card"><div class="tbl-wrap">';
+  h += `<table><thead><tr><th>Name</th><th>Size</th></tr></thead><tbody>`;
+  (d.tablespaces||[]).forEach(ts => {
+    h += `<tr><td>${escHtml(ts.spcname)}</td><td>${escHtml(ts.size_pretty||'—')}</td></tr>`;
+  });
+  h += '</tbody></table></div></div>';
+
+  // ── Index advisor ────────────────────────────────────────────
+  if ((d.index_advisor||[]).length) {
+    h += '<div class="section-title">Query Advisor — Index Recommendations</div>';
+    h += '<div class="card"><div class="tbl-wrap">';
+    h += `<table><thead><tr><th>Query</th><th>Advice</th></tr></thead><tbody>`;
+    d.index_advisor.forEach(q => {
+      h += `<tr>
+        <td><code style="font-size:11px">${escHtml(q.query||'')}</code></td>
+        <td>${escHtml(q.index_advice||'')}</td>
+      </tr>`;
+    });
+    h += '</tbody></table></div></div>';
+  }
+
+  // ── Configuration ────────────────────────────────────────────
+  const settings = d.settings || [];
+  h += '<div class="section-title">Key Configuration Parameters</div><div class="grid-2">';
+  const half = Math.ceil(settings.length / 2);
+  [settings.slice(0, half), settings.slice(half)].forEach(grp => {
+    h += '<div class="card"><div class="kv-list">';
+    grp.forEach(s => {
+      const val = s.setting + (s.unit ? ' ' + s.unit : '');
+      const src = s.source !== 'default'
+        ? `<span style="color:var(--accent);font-size:10px;margin-left:4px">[${s.source}]</span>` : '';
+      h += `<span class="kv-key">${escHtml(s.name)}</span><span class="kv-val">${escHtml(val)}${src}</span>`;
+    });
+    h += '</div></div>';
+  });
+  h += '</div><div style="height:32px"></div>';
+
+  return h;
+}
+
+// ============================================================
+// system_stats panel
+// ============================================================
+function buildSystemStatsPanel(data) {
+  const SEC = '<div class="section-title">System Statistics <small style="font-size:11px;color:var(--muted);font-weight:400">(system_stats extension)</small></div>';
+
+  if (data === null || data === undefined) {
+    return SEC + `<div class="card" style="color:var(--muted);text-align:center;padding:28px 16px">
+      Please install the <code>system_stats</code> extension to see OS-level metrics.<br>
+      <span style="font-size:11px;margin-top:6px;display:block">
+        <code>CREATE EXTENSION system_stats;</code>
+      </span></div>`;
+  }
+  if (data.error) {
+    return SEC + `<div class="card" style="color:var(--red);padding:16px"><b>Error:</b> ${escHtml(data.error)}</div>`;
+  }
+
+  let h = SEC;
+
+  // ── OS + Load avg ──
+  const os  = data.os  || {};
+  const lav = data.load_avg || {};
+  const mem = data.memory || {};
+  const cpu = data.cpu_usage || {};
+
+  h += '<div class="grid-4">';
+
+  // pg_sys_os_info() columns: name, version, host_name, domain_name,
+  //   handle_count, process_count, thread_count, architecture,
+  //   last_bootup_time, os_up_since_seconds
+  if (os.host_name || os.name) {
+    h += card('Host / OS', `
+      <div class="card-value lg" style="font-size:15px">${escHtml(os.host_name || '—')}</div>
+      <div class="card-sub">${escHtml(os.name || '')} ${escHtml(os.version || '')}</div>
+      <div class="card-sub" style="margin-top:4px">
+        Processes: ${fmtNum(os.process_count ?? null)} &nbsp;
+        Threads: ${fmtNum(os.thread_count ?? null)} &nbsp;
+        Arch: ${escHtml(os.architecture || '—')}
+      </div>`);
+  }
+
+  // pg_sys_load_avg_info() columns: load_avg_one_minute, load_avg_five_minutes,
+  //   load_avg_ten_minutes, load_avg_fifteen_minutes
+  if (lav.load_avg_one_minute !== undefined) {
+    const la1  = parseFloat(lav.load_avg_one_minute   || 0);
+    const la5  = parseFloat(lav.load_avg_five_minutes  || 0);
+    const la15 = parseFloat(lav.load_avg_fifteen_minutes || lav.load_avg_ten_minutes || 0);
+    const cl   = la1 > 4 ? 'red' : la1 > 2 ? 'amber' : 'green';
+    h += card('Load Average', `
+      <div class="card-value ${cl}">${la1.toFixed(2)}</div>
+      <div class="card-sub">1 min · 5 min: ${la5.toFixed(2)} · 15 min: ${la15.toFixed(2)}</div>`);
+  }
+
+  // pg_sys_memory_info() columns: total_memory, used_memory, free_memory,
+  //   swap_total, swap_used, swap_free, cache_total, …
+  if (mem.total_memory !== undefined) {
+    const total = parseInt(mem.total_memory || 0);
+    const used  = parseInt(mem.used_memory  || 0);
+    const pct   = total ? Math.round(100 * used / total) : 0;
+    const mc    = pct > 85 ? 'red' : pct > 70 ? 'amber' : 'green';
+    h += card('Memory', `
+      <div class="card-value ${mc}">${fmtBytes(used)}</div>
+      <div class="card-sub">used of ${fmtBytes(total)} (${pct}%)</div>
+      <div class="progress-wrap">
+        <div class="progress-bar"><div class="progress-fill" style="width:${pct}%;background:var(--${mc})"></div></div>
+        <span class="progress-pct">${pct}%</span>
+      </div>
+      <div class="card-sub" style="margin-top:5px;font-size:11px">
+        Swap: ${fmtBytes(mem.swap_used||0)} / ${fmtBytes(mem.swap_total||0)}
+      </div>`);
+  }
+
+  // pg_sys_cpu_usage_info() columns: usermode_normal_process_percent,
+  //   usermode_niced_process_percent, kernelmode_process_percent,
+  //   idle_mode_percent, io_completion_percent, …
+  if (cpu.usermode_normal_process_percent !== undefined || cpu.idle_mode_percent !== undefined) {
+    const userPct = parseFloat(cpu.usermode_normal_process_percent || 0);
+    const sysPct  = parseFloat(cpu.kernelmode_process_percent      || 0);
+    const idlePct = parseFloat(cpu.idle_mode_percent               || 0);
+    const ioPct   = parseFloat(cpu.io_completion_percent           || 0);
+    const busyPct = Math.round(100 - idlePct);
+    const cc      = busyPct > 85 ? 'red' : busyPct > 70 ? 'amber' : 'green';
+    h += card('CPU Usage', `
+      <div class="card-value ${cc}">${busyPct}%</div>
+      <div class="card-sub">busy · user ${userPct.toFixed(1)}% · sys ${sysPct.toFixed(1)}% · I/O ${ioPct.toFixed(1)}% · idle ${idlePct.toFixed(1)}%</div>`);
+  }
+
+  h += '</div>';
+
+  // ── CPU info table ──
+  const cpuInfo = data.cpu_info || [];
+  if (cpuInfo.length) {
+    h += '<div class="card" style="margin-top:14px"><div class="card-title">CPU Info</div><div class="tbl-wrap"><table><thead><tr>';
+    const cpuCols = Object.keys(cpuInfo[0]);
+    cpuCols.forEach(c => { h += `<th>${escHtml(c)}</th>`; });
+    h += '</tr></thead><tbody>';
+    cpuInfo.forEach(row => {
+      h += '<tr>' + cpuCols.map(c => `<td>${escHtml(row[c] ?? '')}</td>`).join('') + '</tr>';
+    });
+    h += '</tbody></table></div></div>';
+  }
+
+  // ── Disk table ──
+  const disks = data.disk || [];
+  if (disks.length) {
+    h += '<div class="card" style="margin-top:14px"><div class="card-title">Disk Usage</div><div class="tbl-wrap"><table><thead><tr>';
+    const diskCols = Object.keys(disks[0]);
+    diskCols.forEach(c => { h += `<th>${escHtml(c)}</th>`; });
+    h += '</tr></thead><tbody>';
+    disks.forEach(row => {
+      h += '<tr>' + diskCols.map(c => `<td>${escHtml(row[c] ?? '')}</td>`).join('') + '</tr>';
+    });
+    h += '</tbody></table></div></div>';
+  }
+
+  // ── Network table ──
+  const nets = data.network || [];
+  if (nets.length) {
+    h += '<div class="card" style="margin-top:14px"><div class="card-title">Network</div><div class="tbl-wrap"><table><thead><tr>';
+    const netCols = Object.keys(nets[0]);
+    netCols.forEach(c => { h += `<th>${escHtml(c)}</th>`; });
+    h += '</tr></thead><tbody>';
+    nets.forEach(row => {
+      h += '<tr>' + netCols.map(c => `<td>${escHtml(row[c] ?? '')}</td>`).join('') + '</tr>';
+    });
+    h += '</tbody></table></div></div>';
+  }
+
+  return h;
+}
+
+// ============================================================
+// pg_tuner panel
+// ============================================================
+function buildPgTunerPanel(data) {
+  const SEC = '<div class="section-title">EDB pg_tuner — Tuning Recommendations <small style="font-size:11px;color:var(--muted);font-weight:400">(edb_pg_tuner extension)</small></div>';
+
+  if (data === null || data === undefined) {
+    return SEC + `<div class="card" style="color:var(--muted);text-align:center;padding:28px 16px">
+      Please install the <code>edb_pg_tuner</code> extension to see automated tuning recommendations.<br>
+      <span style="font-size:11px;margin-top:6px;display:block">
+        <code>CREATE EXTENSION edb_pg_tuner;</code>
+      </span></div>`;
+  }
+  if (data.error) {
+    return SEC + `<div class="card" style="color:var(--red);padding:16px"><b>Error:</b> ${escHtml(data.error)}</div>`;
+  }
+
+  // data = { recommendations: [{param, recommended, current}, …], alter_sql: […] }
+  const recs      = data.recommendations || [];
+  const alterSql  = data.alter_sql || [];
+
+  if (recs.length === 0) {
+    return SEC + `<div class="card" style="color:var(--muted);padding:16px">
+      No recommendations at this time — your configuration looks good.</div>`;
+  }
+
+  // Classify: changed = recommended differs from current
+  const changed = recs.filter(r => r.current !== r.recommended);
+  const ok      = recs.filter(r => r.current === r.recommended);
+
+  // ── Summary banner ──
+  let banner;
+  if (changed.length > 0) {
+    banner = `<div style="margin-bottom:14px;padding:10px 14px;border-radius:8px;
+        background:#3b1f0a;border:1px solid var(--amber);color:var(--amber);font-size:13px">
+      ⚠ <b>${changed.length} parameter${changed.length>1?'s':''}</b> differ from
+      edb_pg_tuner recommendations.
+    </div>`;
+  } else {
+    banner = `<div style="margin-bottom:14px;padding:10px 14px;border-radius:8px;
+        background:#0a2318;border:1px solid var(--green);color:var(--green);font-size:13px">
+      ✓ All ${recs.length} monitored parameters match edb_pg_tuner recommendations.
+    </div>`;
+  }
+
+  let h = SEC + banner;
+
+  // ── Recommendations table ──
+  h += `<div class="card"><div class="tbl-wrap"><table>
+    <thead><tr>
+      <th>Parameter</th>
+      <th>Current</th>
+      <th>Recommended</th>
+      <th>Status</th>
+    </tr></thead>
+    <tbody>`;
+  recs.forEach(r => {
+    const diff = r.current !== r.recommended;
+    const statusCell = diff
+      ? `<td><span class="badge badge-amber">change needed</span></td>`
+      : `<td><span class="badge badge-green">✓ ok</span></td>`;
+    h += `<tr>
+      <td><code>${escHtml(r.param)}</code></td>
+      <td style="color:var(--muted)">${escHtml(r.current ?? '—')}</td>
+      <td style="${diff ? 'color:var(--amber);font-weight:600' : 'color:var(--green)'}">${escHtml(r.recommended)}</td>
+      ${statusCell}
+    </tr>`;
+  });
+  h += '</tbody></table></div>';
+
+  // ── ALTER SYSTEM snippet ──
+  if (changed.length > 0 && alterSql.length > 0) {
+    const snippet = alterSql.join('\n') + '\nSELECT pg_reload_conf();';
+    h += `<details style="margin-top:12px">
+      <summary style="cursor:pointer;font-size:12px;color:var(--accent)">
+        ▶ Show ALTER SYSTEM statements (${changed.length} change${changed.length>1?'s':''})
+      </summary>
+      <pre style="margin-top:8px;background:var(--bg);border:1px solid var(--border);
+          border-radius:6px;padding:10px;font-size:11px;overflow-x:auto;white-space:pre">${escHtml(snippet)}</pre>
+    </details>`;
+  }
+
+  h += '</div>';
+  return h;
+}
+
+// ============================================================
+// History + charts
+// ============================================================
+function pushHistory(id, d) {
+  if (!histBuf[id]) histBuf[id] = {tps:[],conn:[],cache:[],ts:[]};
+  const h = histBuf[id];
+  h.ts.push(new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'}));
+  h.tps.push(d.tps || 0);
+  h.conn.push((d.connections||{}).total || 0);
+  h.cache.push(avgCacheHit(d.databases||[]));
+  ['tps','conn','cache','ts'].forEach(k => { if (h[k].length > MAX_HIST) h[k].shift(); });
+}
+
+function drawCharts(id, d) {
+  const h = histBuf[id] || {tps:[],conn:[],cache:[],ts:[]};
+  upsertLine(`c-tps-${id}`,   h.ts, h.tps,   'TPS',            '#4f8ef7');
+  upsertLine(`c-conn-${id}`,  h.ts, h.conn,   'Connections',    '#22c55e');
+  upsertLine(`c-cache-${id}`, h.ts, h.cache,  'Cache Hit %',    '#7c5cd8', 0, 100);
+  if ((d.wait_states||[]).length) {
+    upsertPie(`c-wait-${id}`,
+      d.wait_states.map(w => (w.wait_event_type||'')+':'+(w.wait_event||'')),
+      d.wait_states.map(w => w.cnt));
+  }
+}
+
+const PALETTE = ['#4f8ef7','#22c55e','#f59e0b','#ef4444','#7c5cd8','#06b6d4','#ec4899','#84cc16'];
+
+function upsertLine(cid, labels, data, label, color, yMin, yMax) {
+  const canvas = document.getElementById(cid);
+  if (!canvas) return;
+  if (charts[cid]) {
+    charts[cid].data.labels = labels;
+    charts[cid].data.datasets[0].data = data;
+    charts[cid].update('none');
+    return;
+  }
+  charts[cid] = new Chart(canvas, {
+    type: 'line',
+    data: { labels, datasets: [{
+      label, data, borderColor: color,
+      backgroundColor: color+'22', fill: true,
+      tension: 0.3, pointRadius: 2, borderWidth: 2,
+    }]},
+    options: {
+      responsive:true, maintainAspectRatio:true, animation:false,
+      plugins:{ legend:{display:false}, tooltip:{mode:'index'} },
+      scales:{
+        x:{ ticks:{color:'#6b7280',font:{size:10},maxTicksLimit:5}, grid:{color:'#2a2e42'} },
+        y:{ ticks:{color:'#6b7280',font:{size:10}},                 grid:{color:'#2a2e42'},
+            ...(yMin!==undefined?{min:yMin}:{}), ...(yMax!==undefined?{max:yMax}:{}) },
+      }
+    }
+  });
+}
+
+function upsertPie(cid, labels, data) {
+  const canvas = document.getElementById(cid);
+  if (!canvas) return;
+  if (charts[cid]) {
+    charts[cid].data.labels = labels;
+    charts[cid].data.datasets[0].data = data;
+    charts[cid].update('none');
+    return;
+  }
+  charts[cid] = new Chart(canvas, {
+    type: 'doughnut',
+    data: { labels, datasets: [{ data, backgroundColor: PALETTE, borderWidth:1, borderColor:'#1e2130' }] },
+    options: {
+      responsive:true, maintainAspectRatio:true, animation:false,
+      plugins:{ legend:{ position:'right', labels:{ color:'#9ca3af', font:{size:11}, boxWidth:14 } } }
+    }
+  });
+}
+
+// ============================================================
+// Helpers
+// ============================================================
+function card(title, content) {
+  return `<div class="card"><div class="card-title">${escHtml(title)}</div>${content}</div>`;
+}
+function avgCacheHit(dbs) {
+  const vs = dbs.filter(d=>d.cache_hit_ratio!==null).map(d=>parseFloat(d.cache_hit_ratio));
+  return vs.length ? +(vs.reduce((a,b)=>a+b,0)/vs.length).toFixed(2) : 0;
+}
+function escHtml(s) {
+  if (s==null) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+                  .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+function escAttr(s) { return escHtml(s).replace(/'/g,'&#39;'); }
+function v(id)      { return (document.getElementById(id)||{}).value || ''; }
+function setv(id,val){ const el=document.getElementById(id); if(el) el.value=val; }
+function fmtNum(n) {
+  if (n==null) return '—';
+  const f = parseFloat(n);
+  if (isNaN(f)) return escHtml(String(n));
+  return Number.isInteger(f) ? f.toLocaleString() : f.toLocaleString(undefined,{maximumFractionDigits:2});
+}
+function fmtBytes(b) {
+  b = parseInt(b); if (isNaN(b)) return '—';
+  if (b<1024) return b+' B';
+  if (b<1048576) return (b/1024).toFixed(1)+' KB';
+  if (b<1073741824) return (b/1048576).toFixed(1)+' MB';
+  return (b/1073741824).toFixed(2)+' GB';
+}
+function fmtUptime(s) {
+  if (!s) return '—';
+  const d=Math.floor(s/86400), h=Math.floor((s%86400)/3600), m=Math.floor((s%3600)/60);
+  return (d?d+'d ':'')+( h?h+'h ':'')+m+'m';
+}
+function fmtDate(s) {
+  if (!s||s==='None'||s==='null') return '—';
+  try { const d=new Date(s); return isNaN(d)?s:d.toLocaleString([],{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}); }
+  catch { return s; }
+}
+function stateClass(st) {
+  if (!st) return '';
+  if (st==='active') return 'badge-green';
+  if (st.startsWith('idle in transaction')) return st.includes('abort')?'badge-red':'badge-amber';
+  return 'badge-blue';
+}
+</script>
+</body>
+</html>
