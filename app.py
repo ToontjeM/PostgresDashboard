@@ -78,6 +78,7 @@ _cache_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 HISTORY_MAXLEN = 250
 _history = {}       # instance_id -> {"ts": deque, "tps": deque, "conn": deque, "cache": deque}
+_prev_xact = {}      # instance_id -> (monotonic_time, cumulative xact_commit+xact_rollback)
 _history_lock = threading.Lock()
 
 
@@ -215,15 +216,18 @@ def collect_instance(inst):
             ORDER BY size_bytes DESC
         """)
 
-        # --- TPS -----------------------------------------------------------
-        tps = scalar(conn, """
-            SELECT ROUND(
-                SUM(xact_commit + xact_rollback)::numeric /
-                GREATEST(EXTRACT(EPOCH FROM (now() - MIN(stats_reset))), 1), 2)
-            FROM pg_stat_database
-            WHERE datname NOT IN ('template0','template1')
-        """)
-        result["tps"] = float(tps) if tps else 0.0
+        # --- TPS -------------------------------------------------------------
+        # A live rate (delta cumulative xacts / delta wall time between
+        # polls), computed in collect_and_record — NOT "cumulative xacts /
+        # time since stats_reset". stats_reset is NULL on some replicas,
+        # which silently collapsed that division to a divide-by-1-second and
+        # reported the raw, ever-growing cumulative transaction count as
+        # "TPS" (a number that can only ever climb).
+        result["xact_total"] = sum(
+            (db.get("xact_commit") or 0) + (db.get("xact_rollback") or 0)
+            for db in result["databases"]
+        )
+        result["tps"] = 0.0  # overwritten by collect_and_record once a previous sample exists
 
         # --- Bgwriter / checkpointer (PG 17+ split) ------------------------
         pgver = result.get("pg_version_num", 0)
@@ -463,8 +467,24 @@ def collect_and_record(inst):
             "cache": deque(maxlen=HISTORY_MAXLEN),
         })
         if not result.get("error"):
+            # TPS as a live rate: delta cumulative xacts / delta wall time
+            # since the previous poll. Falls back to 0 on the first sample
+            # (no baseline yet) or if the counter went backwards (stats
+            # reset / failover between polls).
+            now_m = time.monotonic()
+            xact_total = result.get("xact_total") or 0
+            prev = _prev_xact.get(inst_id)
+            tps = 0.0
+            if prev is not None:
+                prev_time, prev_total = prev
+                elapsed = now_m - prev_time
+                if elapsed > 0 and xact_total >= prev_total:
+                    tps = round((xact_total - prev_total) / elapsed, 2)
+            _prev_xact[inst_id] = (now_m, xact_total)
+            result["tps"] = tps
+
             h["ts"].append(datetime.now(timezone.utc).strftime("%H:%M:%S"))
-            h["tps"].append(result.get("tps") or 0)
+            h["tps"].append(tps)
             h["conn"].append((result.get("connections") or {}).get("total") or 0)
             h["cache"].append(_avg_cache_hit(result.get("databases") or []))
         result["history"] = {k: list(v) for k, v in h.items()}
@@ -502,6 +522,8 @@ def refresh_all():
     with _history_lock:
         for k in [k for k in _history if k not in active_ids]:
             del _history[k]
+        for k in [k for k in _prev_xact if k not in active_ids]:
+            del _prev_xact[k]
 
 
 def background_refresh():
@@ -571,6 +593,7 @@ def api_remove_instance(instance_id):
         _cache.pop(instance_id, None)
     with _history_lock:
         _history.pop(instance_id, None)
+        _prev_xact.pop(instance_id, None)
 
     return jsonify({"ok": True})
 
@@ -694,6 +717,87 @@ def api_index_recommendation_queries(instance_id):
             (queryids,),
         )
         return jsonify({"queries": rows})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/instances/<instance_id>/database-schema", methods=["POST"])
+def api_database_schema(instance_id):
+    """Schemas/tables/columns/indexes for one database on this instance.
+
+    The instance's stored connection targets one specific dbname, but the
+    Databases table lists every database on the server — so this opens a
+    fresh connection with dbname swapped to whichever one was clicked.
+    """
+    body = request.get_json(force=True) or {}
+    dbname = body.get("dbname")
+    if not dbname:
+        return jsonify({"error": "missing dbname"}), 400
+
+    inst = next((i for i in get_instances() if i["id"] == instance_id), None)
+    if not inst:
+        return jsonify({"error": "unknown instance"}), 404
+
+    target = dict(inst, dbname=dbname)
+    try:
+        conn = psycopg2.connect(make_dsn(target))
+        conn.autocommit = True
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    try:
+        schemas = [r["nspname"] for r in query(conn, """
+            SELECT nspname FROM pg_namespace
+            WHERE nspname NOT IN ('pg_catalog','information_schema','pg_toast')
+              AND nspname NOT LIKE 'pg_temp%%' AND nspname NOT LIKE 'pg_toast_temp%%'
+            ORDER BY nspname
+        """)]
+
+        tables = query(conn, """
+            SELECT n.nspname AS schema, c.relname AS name,
+                   pg_size_pretty(pg_total_relation_size(c.oid)) AS size_pretty,
+                   GREATEST(c.reltuples::bigint, 0) AS row_estimate
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relkind = 'r' AND n.nspname = ANY(%s)
+            ORDER BY n.nspname, c.relname
+        """, (schemas,))
+
+        columns = query(conn, """
+            SELECT table_schema AS schema, table_name, column_name AS name,
+                   data_type AS type, is_nullable = 'YES' AS nullable, column_default AS default
+            FROM information_schema.columns
+            WHERE table_schema = ANY(%s)
+            ORDER BY table_schema, table_name, ordinal_position
+        """, (schemas,))
+
+        indexes = query(conn, """
+            SELECT n.nspname AS schema, t.relname AS table_name, i.relname AS name,
+                   pg_get_indexdef(ix.indexrelid) AS def,
+                   pg_size_pretty(pg_relation_size(ix.indexrelid)) AS size_pretty
+            FROM pg_index ix
+            JOIN pg_class i ON i.oid = ix.indexrelid
+            JOIN pg_class t ON t.oid = ix.indrelid
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+            WHERE n.nspname = ANY(%s)
+            ORDER BY n.nspname, t.relname, i.relname
+        """, (schemas,))
+
+        cols_by_table = {}
+        for c in columns:
+            cols_by_table.setdefault((c["schema"], c["table_name"]), []).append(c)
+        idx_by_table = {}
+        for i in indexes:
+            idx_by_table.setdefault((i["schema"], i["table_name"]), []).append(i)
+
+        for t in tables:
+            key = (t["schema"], t["name"])
+            t["columns"] = cols_by_table.get(key, [])
+            t["indexes"] = idx_by_table.get(key, [])
+
+        return jsonify({"schemas": schemas, "tables": tables})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:

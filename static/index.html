@@ -421,6 +421,41 @@ tr:hover td { background:var(--row-hover); }
 }
 .link-btn:hover { color:var(--accent2); }
 
+/* Schema browser overlay */
+#schema-overlay {
+  position:fixed; inset:0; background:rgba(0,0,0,.6);
+  display:flex; align-items:center; justify-content:center; z-index:200;
+}
+#schema-overlay.hidden { display:none; }
+#schema-box {
+  background:var(--card); border:1px solid var(--border); border-radius:12px;
+  box-shadow: var(--shadow-2);
+  padding:20px; width:94%; max-width:1200px; height:85vh;
+  display:flex; flex-direction:column; gap:10px;
+}
+#schema-header { display:flex; align-items:center; justify-content:space-between; flex-shrink:0; }
+#schema-header h3 { font-size:16px; }
+#schema-tabs { display:flex; gap:4px; flex-wrap:wrap; flex-shrink:0; }
+.schema-tab {
+  padding:5px 12px; border-radius:6px; border:1px solid var(--border);
+  background:var(--bg); color:var(--text2); cursor:pointer; font-size:12px;
+  font-family:var(--font);
+}
+.schema-tab.active { border-color:var(--accent); color:var(--accent); background:color-mix(in srgb, var(--accent) 10%, transparent); }
+#schema-body { overflow:auto; flex:1; }
+.schema-table-row summary {
+  cursor:pointer; padding:8px 10px; border-radius:6px; list-style:none;
+  display:flex; align-items:center; justify-content:space-between; gap:10px;
+}
+.schema-table-row summary::-webkit-details-marker { display:none; }
+.schema-table-row summary:hover { background:var(--hover-overlay); }
+.schema-table-row[open] summary { color:var(--accent); }
+.schema-table-name { font-weight:600; color:var(--text); font-family:var(--font); }
+.schema-table-meta { font-size:11px; color:var(--muted); white-space:nowrap; }
+.schema-table-detail { padding:6px 10px 16px 26px; display:flex; gap:20px; flex-wrap:wrap; }
+.schema-table-detail > div { flex:1; min-width:280px; }
+.schema-table-detail h4 { font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); margin-bottom:6px; }
+
 /* Sortable table headers */
 th.sortable-th { cursor:pointer; user-select:none; white-space:nowrap; }
 th.sortable-th:hover { color:var(--accent) !important; }
@@ -477,6 +512,18 @@ tr.row-clickable:hover { background:color-mix(in srgb, var(--accent) 7%, transpa
       <button class="btn" onclick="closeBenefitedQueries()">✕ Close</button>
     </div>
     <div id="benefited-body"></div>
+  </div>
+</div>
+
+<!-- Schema browser dialog -->
+<div id="schema-overlay" class="hidden">
+  <div id="schema-box">
+    <div id="schema-header">
+      <h3 id="schema-title">Schema Browser</h3>
+      <button class="btn" onclick="closeSchemaBrowser()">✕ Close</button>
+    </div>
+    <div id="schema-tabs"></div>
+    <div id="schema-body"></div>
   </div>
 </div>
 
@@ -1088,7 +1135,7 @@ function buildPanel(inst, d) {
       Waiting <b>${c.waiting||0}</b>
     </div>`);
 
-  h += card('TPS (avg since reset)', `
+  h += card('TPS', `
     <div class="card-value">${fmtNum(d.tps)}</div>
     <div class="card-sub">transactions / second</div>
     <div class="progress-wrap">
@@ -1152,7 +1199,7 @@ function buildPanel(inst, d) {
   h += '</div>';
 
   // ── Databases ────────────────────────────────────────────────
-  h += '<div class="section-title">Databases</div><div class="card"><div class="tbl-wrap">';
+  h += '<div class="section-title">Databases <small style="font-size:11px;color:var(--muted);font-weight:400">(click a row to browse its schemas/tables)</small></div><div class="card"><div class="tbl-wrap">';
   h += `<table><thead><tr>
     <th>Database</th><th>Size</th><th>Backends</th><th>Cache Hit</th>
     <th>Commits</th><th>Rollbacks</th><th>Inserts</th><th>Updates</th><th>Deletes</th>
@@ -1161,7 +1208,7 @@ function buildPanel(inst, d) {
   (d.databases || []).forEach(db => {
     const ch = db.cache_hit_ratio;
     const cs = ch === null ? '' : ch < 90 ? 'color:var(--amber)' : 'color:var(--green)';
-    h += `<tr>
+    h += `<tr class="row-clickable" title="Click to browse schemas, tables and indexes" onclick="showSchemaBrowser('${escAttr(inst.id)}','${escAttr(db.datname)}')">
       <td><b>${escHtml(db.datname)}</b></td>
       <td>${escHtml(db.size_pretty)}</td>
       <td>${db.numbackends}</td>
@@ -1900,6 +1947,99 @@ async function showBenefitedQueries(instId, queryidsJson) {
 
 function closeBenefitedQueries() {
   document.getElementById('benefited-overlay').classList.add('hidden');
+}
+
+// ============================================================
+// Schema browser (Databases table → schemas/tables/columns/indexes)
+// ============================================================
+let schemaBrowserData = null;   // {schemas, tables} for the currently open database
+let schemaBrowserActiveSchema = null;
+
+async function showSchemaBrowser(instId, dbname) {
+  const overlay = document.getElementById('schema-overlay');
+  const title   = document.getElementById('schema-title');
+  const tabs    = document.getElementById('schema-tabs');
+  const body    = document.getElementById('schema-body');
+  overlay.classList.remove('hidden');
+  title.textContent = `Schema Browser — ${dbname}`;
+  tabs.innerHTML = '';
+  body.innerHTML = '<p style="color:var(--muted);padding:10px">Loading…</p>';
+
+  try {
+    const r = await fetch(`/api/instances/${encodeURIComponent(instId)}/database-schema`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dbname }),
+    });
+    const data = await r.json();
+    if (!r.ok || data.error) {
+      body.innerHTML = `<p style="color:var(--red);padding:10px">Error: ${escHtml(data.error || 'unknown error')}</p>`;
+      return;
+    }
+    schemaBrowserData = data;
+    schemaBrowserActiveSchema = data.schemas.includes('public') ? 'public' : (data.schemas[0] || null);
+    renderSchemaTabs();
+    renderSchemaTables();
+  } catch (e) {
+    body.innerHTML = `<p style="color:var(--red);padding:10px">Error: ${escHtml(e.message)}</p>`;
+  }
+}
+
+function renderSchemaTabs() {
+  const tabs = document.getElementById('schema-tabs');
+  tabs.innerHTML = (schemaBrowserData.schemas || []).map(s =>
+    `<button class="schema-tab${s===schemaBrowserActiveSchema?' active':''}" onclick="switchSchemaBrowserTab('${escAttr(s)}')">${escHtml(s)}</button>`
+  ).join('');
+}
+
+function switchSchemaBrowserTab(schema) {
+  schemaBrowserActiveSchema = schema;
+  renderSchemaTabs();
+  renderSchemaTables();
+}
+
+function renderSchemaTables() {
+  const body = document.getElementById('schema-body');
+  const tables = (schemaBrowserData.tables || []).filter(t => t.schema === schemaBrowserActiveSchema);
+  if (!tables.length) {
+    body.innerHTML = '<p style="color:var(--muted);padding:10px">No tables in this schema.</p>';
+    return;
+  }
+  let h = '';
+  tables.forEach(t => {
+    h += `<details class="schema-table-row">
+      <summary>
+        <span class="schema-table-name">${escHtml(t.name)}</span>
+        <span class="schema-table-meta">${fmtNum(t.row_estimate)} rows (est.) · ${escHtml(t.size_pretty)}</span>
+      </summary>
+      <div class="schema-table-detail">
+        <div>
+          <h4>Columns (${t.columns.length})</h4>
+          <div class="tbl-wrap"><table><thead><tr><th>Name</th><th>Type</th><th>Nullable</th><th>Default</th></tr></thead><tbody>
+            ${t.columns.map(c => `<tr>
+              <td>${escHtml(c.name)}</td><td>${escHtml(c.type)}</td>
+              <td>${c.nullable ? 'yes' : 'no'}</td><td>${escHtml(c.default||'')}</td>
+            </tr>`).join('')}
+          </tbody></table></div>
+        </div>
+        <div>
+          <h4>Indexes (${t.indexes.length})</h4>
+          ${t.indexes.length ? `<div class="tbl-wrap"><table><thead><tr><th>Name</th><th>Definition</th><th>Size</th></tr></thead><tbody>
+            ${t.indexes.map(ix => `<tr>
+              <td>${escHtml(ix.name)}</td>
+              <td><code style="font-size:11px;word-break:break-all">${escHtml(ix.def)}</code></td>
+              <td>${escHtml(ix.size_pretty)}</td>
+            </tr>`).join('')}
+          </tbody></table></div>` : '<p style="color:var(--muted);font-size:12px">None.</p>'}
+        </div>
+      </div>
+    </details>`;
+  });
+  body.innerHTML = h;
+}
+
+function closeSchemaBrowser() {
+  document.getElementById('schema-overlay').classList.add('hidden');
 }
 
 // ============================================================
