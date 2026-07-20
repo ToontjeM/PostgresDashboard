@@ -159,9 +159,22 @@ body { background: var(--bg); color: var(--text); font-family: var(--font); font
    ============================================================ */
 .section-title {
   font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px;
-  color: var(--muted); margin: 24px 0 10px; padding-bottom: 6px;
+  color: var(--text); margin: 24px 0 10px; padding-bottom: 6px;
   border-bottom: 1px solid var(--border);
 }
+.group-title {
+  display: flex; align-items: center; gap: 10px;
+  font-size: 15px; font-weight: 800; letter-spacing: .3px;
+  color: var(--text); margin: 40px 0 4px; padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.group-title:first-child { margin-top: 0; }
+.group-num {
+  display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+  width: 22px; height: 22px; border-radius: 50%; font-size: 11px; font-weight: 700;
+  color: #fff; background: linear-gradient(135deg, var(--accent), var(--accent2));
+}
+.group-sub { font-size: 11px; font-weight: 400; color: var(--muted); }
 .grid-4 { display: grid; grid-template-columns: repeat(4,1fr); gap: 14px; }
 .grid-3 { display: grid; grid-template-columns: repeat(3,1fr); gap: 14px; }
 .grid-2 { display: grid; grid-template-columns: repeat(2,1fr); gap: 14px; }
@@ -169,7 +182,7 @@ body { background: var(--bg); color: var(--text); font-family: var(--font); font
 @media (max-width: 900px){ .grid-4,.grid-3,.grid-2 { grid-template-columns: 1fr; } }
 
 .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
-.card-title { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .7px; color: var(--muted); margin-bottom: 8px; }
+.card-title { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .7px; color: var(--text); margin-bottom: 8px; }
 .card-value { font-size: 30px; font-weight: 700; color: var(--text); line-height: 1.15; }
 .card-value.lg { font-size: 24px; }
 .card-value.green { color: var(--green); }
@@ -607,11 +620,10 @@ function buildPanel(inst, d) {
 
   let h = '';
 
-  // ── system_stats ─────────────────────────────────────────────
-  h += buildSystemStatsPanel(d.system_stats);
-
-  // ── pg_tuner ─────────────────────────────────────────────────
-  h += buildPgTunerPanel(d.pg_tuner);
+  // ============================================================
+  // Group 1 — Database Overview
+  // ============================================================
+  h += groupTitle(1, 'Database Overview');
 
   // ── Overview cards ──────────────────────────────────────────
   h += '<div class="section-title">Overview</div><div class="grid-4">';
@@ -701,6 +713,98 @@ function buildPanel(inst, d) {
   });
   h += '</tbody></table></div></div>';
 
+  // ── Bloat / vacuum ───────────────────────────────────────────
+  if ((d.bloat_tables||[]).length) {
+    h += '<div class="section-title">Table Bloat &amp; Vacuum (top 10 by dead tuples)</div>';
+    h += '<div class="card"><div class="tbl-wrap">';
+    h += `<table><thead><tr>
+      <th>Schema</th><th>Table</th><th>Live</th><th>Dead</th><th>Dead %</th>
+      <th>Last Vacuum</th><th>Last Autovacuum</th><th>Last Analyze</th><th>Last Autoanalyze</th>
+    </tr></thead><tbody>`;
+    d.bloat_tables.forEach(t => {
+      const dr = parseFloat(t.dead_ratio||0);
+      h += `<tr>
+        <td>${escHtml(t.schemaname)}</td><td>${escHtml(t.relname)}</td>
+        <td>${fmtNum(t.n_live_tup)}</td><td>${fmtNum(t.n_dead_tup)}</td>
+        <td style="${dr>20?'color:var(--red)':dr>10?'color:var(--amber)':''}">${dr}%</td>
+        <td>${fmtDate(t.last_vacuum)}</td><td>${fmtDate(t.last_autovacuum)}</td>
+        <td>${fmtDate(t.last_analyze)}</td><td>${fmtDate(t.last_autoanalyze)}</td>
+      </tr>`;
+    });
+    h += '</tbody></table></div></div>';
+  }
+
+  // ── Locks ────────────────────────────────────────────────────
+  h += '<div class="section-title">Locks Summary</div><div class="card"><div class="tbl-wrap">';
+  h += `<table><thead><tr><th>Type</th><th>Mode</th><th>Granted</th><th>Count</th></tr></thead><tbody>`;
+  (d.locks||[]).forEach(l => {
+    h += `<tr>
+      <td>${escHtml(l.locktype)}</td><td>${escHtml(l.mode)}</td>
+      <td><span class="badge ${l.granted?'badge-green':'badge-red'}">${l.granted?'Yes':'No'}</span></td>
+      <td>${l.cnt}</td>
+    </tr>`;
+  });
+  h += '</tbody></table></div></div>';
+
+  // ── Replication ──────────────────────────────────────────────
+  h += '<div class="section-title">Replication</div><div class="card">';
+  if (!(d.replication||[]).length) {
+    h += '<p style="color:var(--muted);padding:4px">No standbys connected.</p>';
+  } else {
+    h += '<div class="tbl-wrap"><table><thead><tr><th>Client</th><th>State</th><th>Sent LSN</th><th>Replay LSN</th><th>Lag</th></tr></thead><tbody>';
+    d.replication.forEach(r => {
+      h += `<tr>
+        <td>${escHtml(r.client_addr||'')}</td><td>${escHtml(r.state||'')}</td>
+        <td>${escHtml(r.sent_lsn||'')}</td><td>${escHtml(r.replay_lsn||'')}</td>
+        <td>${r.replay_lag_bytes!=null?fmtBytes(r.replay_lag_bytes):'—'}</td>
+      </tr>`;
+    });
+    h += '</tbody></table></div>';
+  }
+  h += '</div>';
+
+  // ── Tablespaces ──────────────────────────────────────────────
+  h += '<div class="section-title">Tablespaces</div><div class="card"><div class="tbl-wrap">';
+  h += `<table><thead><tr><th>Name</th><th>Size</th></tr></thead><tbody>`;
+  (d.tablespaces||[]).forEach(ts => {
+    h += `<tr><td>${escHtml(ts.spcname)}</td><td>${escHtml(ts.size_pretty||'—')}</td></tr>`;
+  });
+  h += '</tbody></table></div></div>';
+
+  // ── Configuration ────────────────────────────────────────────
+  const settings = d.settings || [];
+  h += '<div class="section-title">Key Configuration Parameters</div><div class="grid-2">';
+  const half = Math.ceil(settings.length / 2);
+  [settings.slice(0, half), settings.slice(half)].forEach(grp => {
+    h += '<div class="card"><div class="kv-list">';
+    grp.forEach(s => {
+      const val = s.setting + (s.unit ? ' ' + s.unit : '');
+      const src = s.source !== 'default'
+        ? `<span style="color:var(--accent);font-size:10px;margin-left:4px">[${s.source}]</span>` : '';
+      h += `<span class="kv-key">${escHtml(s.name)}</span><span class="kv-val">${escHtml(val)}${src}</span>`;
+    });
+    h += '</div></div>';
+  });
+  h += '</div>';
+
+  // ============================================================
+  // Group 2 — Database Recommendations
+  // ============================================================
+  h += groupTitle(2, 'Database Recommendations');
+  h += buildPgTunerPanel(d.pg_tuner);
+  h += buildQueryAdvisorPanel(d.index_advisor);
+
+  // ============================================================
+  // Group 3 — Host Statistics
+  // ============================================================
+  h += groupTitle(3, 'Host Statistics');
+  h += buildSystemStatsPanel(d.system_stats);
+
+  // ============================================================
+  // Group 4 — Query Statistics
+  // ============================================================
+  h += groupTitle(4, 'Query Statistics');
+
   // ── Long queries ─────────────────────────────────────────────
   h += '<div class="section-title">Long-Running Queries</div><div class="card"><div class="tbl-wrap">';
   if (!(d.long_queries||[]).length) {
@@ -767,95 +871,16 @@ function buildPanel(inst, d) {
     h += '</div>';
   }
 
-  // ── Bloat / vacuum ───────────────────────────────────────────
-  if ((d.bloat_tables||[]).length) {
-    h += '<div class="section-title">Table Bloat &amp; Vacuum (top 10 by dead tuples)</div>';
-    h += '<div class="card"><div class="tbl-wrap">';
-    h += `<table><thead><tr>
-      <th>Schema</th><th>Table</th><th>Live</th><th>Dead</th><th>Dead %</th>
-      <th>Last Vacuum</th><th>Last Autovacuum</th><th>Last Analyze</th><th>Last Autoanalyze</th>
-    </tr></thead><tbody>`;
-    d.bloat_tables.forEach(t => {
-      const dr = parseFloat(t.dead_ratio||0);
-      h += `<tr>
-        <td>${escHtml(t.schemaname)}</td><td>${escHtml(t.relname)}</td>
-        <td>${fmtNum(t.n_live_tup)}</td><td>${fmtNum(t.n_dead_tup)}</td>
-        <td style="${dr>20?'color:var(--red)':dr>10?'color:var(--amber)':''}">${dr}%</td>
-        <td>${fmtDate(t.last_vacuum)}</td><td>${fmtDate(t.last_autovacuum)}</td>
-        <td>${fmtDate(t.last_analyze)}</td><td>${fmtDate(t.last_autoanalyze)}</td>
-      </tr>`;
-    });
-    h += '</tbody></table></div></div>';
-  }
-
-  // ── Locks ────────────────────────────────────────────────────
-  h += '<div class="section-title">Locks Summary</div><div class="card"><div class="tbl-wrap">';
-  h += `<table><thead><tr><th>Type</th><th>Mode</th><th>Granted</th><th>Count</th></tr></thead><tbody>`;
-  (d.locks||[]).forEach(l => {
-    h += `<tr>
-      <td>${escHtml(l.locktype)}</td><td>${escHtml(l.mode)}</td>
-      <td><span class="badge ${l.granted?'badge-green':'badge-red'}">${l.granted?'Yes':'No'}</span></td>
-      <td>${l.cnt}</td>
-    </tr>`;
-  });
-  h += '</tbody></table></div></div>';
-
-  // ── Replication ──────────────────────────────────────────────
-  h += '<div class="section-title">Replication</div><div class="card">';
-  if (!(d.replication||[]).length) {
-    h += '<p style="color:var(--muted);padding:4px">No standbys connected.</p>';
-  } else {
-    h += '<div class="tbl-wrap"><table><thead><tr><th>Client</th><th>State</th><th>Sent LSN</th><th>Replay LSN</th><th>Lag</th></tr></thead><tbody>';
-    d.replication.forEach(r => {
-      h += `<tr>
-        <td>${escHtml(r.client_addr||'')}</td><td>${escHtml(r.state||'')}</td>
-        <td>${escHtml(r.sent_lsn||'')}</td><td>${escHtml(r.replay_lsn||'')}</td>
-        <td>${r.replay_lag_bytes!=null?fmtBytes(r.replay_lag_bytes):'—'}</td>
-      </tr>`;
-    });
-    h += '</tbody></table></div>';
-  }
-  h += '</div>';
-
-  // ── Tablespaces ──────────────────────────────────────────────
-  h += '<div class="section-title">Tablespaces</div><div class="card"><div class="tbl-wrap">';
-  h += `<table><thead><tr><th>Name</th><th>Size</th></tr></thead><tbody>`;
-  (d.tablespaces||[]).forEach(ts => {
-    h += `<tr><td>${escHtml(ts.spcname)}</td><td>${escHtml(ts.size_pretty||'—')}</td></tr>`;
-  });
-  h += '</tbody></table></div></div>';
-
-  // ── Index advisor ────────────────────────────────────────────
-  if ((d.index_advisor||[]).length) {
-    h += '<div class="section-title">Query Advisor — Index Recommendations</div>';
-    h += '<div class="card"><div class="tbl-wrap">';
-    h += `<table><thead><tr><th>Query</th><th>Advice</th></tr></thead><tbody>`;
-    d.index_advisor.forEach(q => {
-      h += `<tr>
-        <td><code style="font-size:11px">${escHtml(q.query||'')}</code></td>
-        <td>${escHtml(q.index_advice||'')}</td>
-      </tr>`;
-    });
-    h += '</tbody></table></div></div>';
-  }
-
-  // ── Configuration ────────────────────────────────────────────
-  const settings = d.settings || [];
-  h += '<div class="section-title">Key Configuration Parameters</div><div class="grid-2">';
-  const half = Math.ceil(settings.length / 2);
-  [settings.slice(0, half), settings.slice(half)].forEach(grp => {
-    h += '<div class="card"><div class="kv-list">';
-    grp.forEach(s => {
-      const val = s.setting + (s.unit ? ' ' + s.unit : '');
-      const src = s.source !== 'default'
-        ? `<span style="color:var(--accent);font-size:10px;margin-left:4px">[${s.source}]</span>` : '';
-      h += `<span class="kv-key">${escHtml(s.name)}</span><span class="kv-val">${escHtml(val)}${src}</span>`;
-    });
-    h += '</div></div>';
-  });
-  h += '</div><div style="height:32px"></div>';
+  h += '<div style="height:32px"></div>';
 
   return h;
+}
+
+// ============================================================
+// Group title helper
+// ============================================================
+function groupTitle(n, label) {
+  return `<div class="group-title"><span class="group-num">${n}</span>${escHtml(label)}</div>`;
 }
 
 // ============================================================
@@ -1072,6 +1097,75 @@ function buildPgTunerPanel(data) {
   }
 
   h += '</div>';
+  return h;
+}
+
+// ============================================================
+// Query Advisor panel
+// ============================================================
+// Illustrative output — shown whenever query_advisor_data has no live rows,
+// so the panel always demonstrates the kind of recommendations the feature
+// produces (missing/redundant/unused indexes, partial indexes, etc).
+const QUERY_ADVISOR_EXAMPLES = [
+  { type: 'Missing Index', badge: 'badge-blue',
+    query: "SELECT * FROM orders WHERE customer_id = $1 AND status = $2",
+    advice: 'CREATE INDEX idx_orders_customer_status ON orders (customer_id, status);',
+    impact: 'Seq scan → index scan, ~92% estimated cost reduction' },
+  { type: 'Missing Index', badge: 'badge-blue',
+    query: "SELECT * FROM events WHERE created_at > $1 ORDER BY created_at DESC",
+    advice: 'CREATE INDEX idx_events_created_at ON events (created_at DESC);',
+    impact: 'Avoids sort + sequential scan on a high-growth table' },
+  { type: 'Partial Index', badge: 'badge-green',
+    query: "SELECT * FROM users WHERE active = true AND email = $1",
+    advice: 'CREATE INDEX idx_active_users_email ON users (email) WHERE active = true;',
+    impact: 'Smaller index footprint, faster lookups on the hot subset' },
+  { type: 'Redundant Index', badge: 'badge-amber',
+    query: '(schema analysis — no single query)',
+    advice: 'DROP INDEX idx_orders_customer_id; -- superseded by idx_orders_customer_status',
+    impact: 'Removes duplicate write overhead; no query depends on it exclusively' },
+  { type: 'Unused Index', badge: 'badge-red',
+    query: '(usage analysis — no single query)',
+    advice: 'DROP INDEX idx_legacy_lookup; -- 0 scans since stats reset',
+    impact: 'Frees storage and speeds up inserts/updates on the table' },
+];
+
+function buildQueryAdvisorPanel(rows) {
+  const SEC = '<div class="section-title">Query Advisor — Index Recommendations <small style="font-size:11px;color:var(--muted);font-weight:400">(query_advisor extension)</small></div>';
+  const live = (rows || []).length > 0;
+
+  let h = SEC;
+  if (!live) {
+    h += `<div style="margin-bottom:14px;padding:10px 14px;border-radius:8px;
+        background:rgba(79,142,247,.08);border:1px solid var(--accent);color:var(--accent2);font-size:13px">
+      ℹ No live recommendations captured yet for this instance — showing
+      <b>typical examples</b> of what Query Advisor surfaces once it has observed
+      workload activity.
+    </div>`;
+  }
+
+  h += '<div class="card"><div class="tbl-wrap">';
+  if (live) {
+    h += `<table><thead><tr><th>Query</th><th>Advice</th></tr></thead><tbody>`;
+    rows.forEach(q => {
+      h += `<tr>
+        <td><code style="font-size:11px">${escHtml(q.query||'')}</code></td>
+        <td>${escHtml(q.index_advice||'')}</td>
+      </tr>`;
+    });
+  } else {
+    h += `<table><thead><tr>
+      <th>Type</th><th>Query Pattern</th><th>Recommendation</th><th>Estimated Impact</th>
+    </tr></thead><tbody>`;
+    QUERY_ADVISOR_EXAMPLES.forEach(q => {
+      h += `<tr>
+        <td><span class="badge ${q.badge}">${escHtml(q.type)}</span></td>
+        <td><code style="font-size:11px;word-break:break-all">${escHtml(q.query)}</code></td>
+        <td><code style="font-size:11px;word-break:break-all">${escHtml(q.advice)}</code></td>
+        <td>${escHtml(q.impact)}</td>
+      </tr>`;
+    });
+  }
+  h += '</tbody></table></div></div>';
   return h;
 }
 
