@@ -11,6 +11,7 @@ import threading
 import traceback
 import urllib.request
 import uuid
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -69,6 +70,15 @@ def get_instances():
 # ---------------------------------------------------------------------------
 _cache = {}
 _cache_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Trend history  (server-side, so it keeps accumulating for every instance
+# regardless of which one the browser currently has open — the background
+# refresh thread polls all of them every 10s either way)
+# ---------------------------------------------------------------------------
+HISTORY_MAXLEN = 250
+_history = {}       # instance_id -> {"ts": deque, "tps": deque, "conn": deque, "cache": deque}
+_history_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -433,6 +443,34 @@ def collect_instance(inst):
     return result
 
 
+def _avg_cache_hit(databases):
+    vals = [float(db["cache_hit_ratio"]) for db in databases if db.get("cache_hit_ratio") is not None]
+    return round(sum(vals) / len(vals), 2) if vals else 0
+
+
+def collect_and_record(inst):
+    """collect_instance(), plus append this sample to the instance's rolling
+    trend history and attach that history to the result. A failed collection
+    (result["error"] set) doesn't add a sample — it just carries the existing
+    history forward so the charts don't get a false zero."""
+    result = collect_instance(inst)
+    inst_id = inst["id"]
+    with _history_lock:
+        h = _history.setdefault(inst_id, {
+            "ts":    deque(maxlen=HISTORY_MAXLEN),
+            "tps":   deque(maxlen=HISTORY_MAXLEN),
+            "conn":  deque(maxlen=HISTORY_MAXLEN),
+            "cache": deque(maxlen=HISTORY_MAXLEN),
+        })
+        if not result.get("error"):
+            h["ts"].append(datetime.now(timezone.utc).strftime("%H:%M:%S"))
+            h["tps"].append(result.get("tps") or 0)
+            h["conn"].append((result.get("connections") or {}).get("total") or 0)
+            h["cache"].append(_avg_cache_hit(result.get("databases") or []))
+        result["history"] = {k: list(v) for k, v in h.items()}
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Background refresh
 # ---------------------------------------------------------------------------
@@ -443,7 +481,7 @@ def refresh_all():
     threads = []
 
     def worker(inst):
-        results[inst["id"]] = collect_instance(inst)
+        results[inst["id"]] = collect_and_record(inst)
 
     for inst in current:
         t = threading.Thread(target=worker, args=(inst,), daemon=True)
@@ -460,6 +498,10 @@ def refresh_all():
             del _cache[k]
         _cache.update(results)
         _cache["_refreshed"] = datetime.now(timezone.utc).isoformat()
+
+    with _history_lock:
+        for k in [k for k in _history if k not in active_ids]:
+            del _history[k]
 
 
 def background_refresh():
@@ -509,7 +551,7 @@ def api_add_instance():
         save_instances(_instances)
 
     # Collect immediately in background so the UI gets data quickly
-    threading.Thread(target=lambda: _cache.__setitem__(new_id, collect_instance(inst))
+    threading.Thread(target=lambda: _cache.__setitem__(new_id, collect_and_record(inst))
                                      or None, daemon=True).start()
 
     return jsonify(inst), 201
@@ -527,6 +569,8 @@ def api_remove_instance(instance_id):
 
     with _cache_lock:
         _cache.pop(instance_id, None)
+    with _history_lock:
+        _history.pop(instance_id, None)
 
     return jsonify({"ok": True})
 
@@ -551,7 +595,7 @@ def api_update_instance(instance_id):
 
     # Re-collect immediately so the UI refreshes with the new connection
     threading.Thread(
-        target=lambda: _cache.__setitem__(instance_id, collect_instance(updated)),
+        target=lambda: _cache.__setitem__(instance_id, collect_and_record(updated)),
         daemon=True
     ).start()
     return jsonify(updated)
@@ -562,7 +606,7 @@ def api_refresh_instance(instance_id):
     inst = next((i for i in get_instances() if i["id"] == instance_id), None)
     if not inst:
         return jsonify({"error": "not found"}), 404
-    data = collect_instance(inst)
+    data = collect_and_record(inst)
     with _cache_lock:
         _cache[instance_id] = data
         _cache["_refreshed"] = datetime.now(timezone.utc).isoformat()

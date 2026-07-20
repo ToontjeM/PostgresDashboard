@@ -248,6 +248,15 @@ body {
   border-bottom: 2px solid transparent;
   border-image: linear-gradient(90deg, var(--accent), var(--accent2)) 1;
 }
+.trend-window-select {
+  font: inherit; color: var(--accent); background: transparent;
+  border: none; border-bottom: 1px dashed var(--accent);
+  cursor: pointer; padding: 0 1px; margin: 0 2px;
+}
+.trend-window-select:hover, .trend-window-select:focus {
+  color: var(--accent2); border-bottom-style: solid; outline: none;
+}
+.trend-window-select option { text-transform: none; color: var(--text); background: var(--card); }
 /* Panel tabs */
 .tabs-bar {
   display: flex; gap: 4px; margin-bottom: 18px; border-bottom: 1px solid var(--border);
@@ -538,7 +547,6 @@ let allData      = {};          // instanceId → metrics object
 let instances    = [];          // ordered list from /api/instances
 let activeId     = null;
 let charts       = {};          // canvasId → Chart instance
-let histBuf      = {};          // instanceId → {tps,conn,cache,ts}[]
 let tpsMax       = {};          // instanceId → highest TPS observed this session
 let formMode     = 'new';       // 'new' | 'edit'
 let formEditId   = null;        // id being edited
@@ -554,7 +562,14 @@ let collapsedGroupIds = new Set(JSON.parse(localStorage.getItem(COLLAPSED_GROUPS
 const ACTIVE_TAB_KEY = 'pgdash-active-tab';
 let activePanelTab = localStorage.getItem(ACTIVE_TAB_KEY) || 'overview';
 
-const MAX_HIST   = 20;
+// Trend history is collected server-side (every instance, every 10s,
+// regardless of what's currently on screen) — this just picks how many of
+// the up-to-250 samples the server keeps to actually chart.
+const TREND_WINDOW_KEY     = 'pgdash-trend-window';
+const TREND_WINDOW_OPTIONS = [20, 50, 100, 250];
+let trendWindow = parseInt(localStorage.getItem(TREND_WINDOW_KEY), 10);
+if (!TREND_WINDOW_OPTIONS.includes(trendWindow)) trendWindow = 20;
+
 let autoTimer    = null;
 
 // ============================================================
@@ -789,7 +804,6 @@ function formDelete() {
 async function doRemoveInstance(id) {
   await fetch('/api/instances/' + id, {method: 'DELETE'});
   delete allData[id];
-  delete histBuf[id];
   Object.keys(charts).filter(k => k.includes(id)).forEach(k => {
     charts[k].destroy(); delete charts[k];
   });
@@ -1027,7 +1041,6 @@ function renderContent() {
   }
 
   panel.innerHTML = buildPanel(inst, d);
-  pushHistory(inst.id, d);
   drawCharts(inst.id, d);
 }
 
@@ -1127,7 +1140,11 @@ function buildPanel(inst, d) {
   h += '</div>';
 
   // ── Trend sparklines ─────────────────────────────────────────
-  h += '<div class="section-title">Trend (last ' + MAX_HIST + ' samples · 10 s intervals)</div>';
+  h += `<div class="section-title">Trend (last
+    <select class="trend-window-select" onchange="setTrendWindow(this.value)">
+      ${TREND_WINDOW_OPTIONS.map(n => `<option value="${n}"${n===trendWindow?' selected':''}>${n}</option>`).join('')}
+    </select>
+    samples · 10 s intervals)</div>`;
   h += '<div class="grid-3">';
   h += `<div class="chart-card"><div class="chart-title">Transactions / Second</div><canvas id="c-tps-${inst.id}"></canvas></div>`;
   h += `<div class="chart-card"><div class="chart-title">Active Connections</div><canvas id="c-conn-${inst.id}"></canvas></div>`;
@@ -1903,21 +1920,21 @@ function switchTab(tabId) {
 // ============================================================
 // History + charts
 // ============================================================
-function pushHistory(id, d) {
-  if (!histBuf[id]) histBuf[id] = {tps:[],conn:[],cache:[],ts:[]};
-  const h = histBuf[id];
-  h.ts.push(new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'}));
-  h.tps.push(d.tps || 0);
-  h.conn.push((d.connections||{}).total || 0);
-  h.cache.push(avgCacheHit(d.databases||[]));
-  ['tps','conn','cache','ts'].forEach(k => { if (h[k].length > MAX_HIST) h[k].shift(); });
+function setTrendWindow(n) {
+  trendWindow = parseInt(n, 10);
+  localStorage.setItem(TREND_WINDOW_KEY, trendWindow);
+  renderContent();
 }
 
 function drawCharts(id, d) {
-  const h = histBuf[id] || {tps:[],conn:[],cache:[],ts:[]};
-  upsertLine(`c-tps-${id}`,   h.ts, h.tps,   'TPS',            '#4f8ef7');
-  upsertLine(`c-conn-${id}`,  h.ts, h.conn,   'Connections',    '#22c55e');
-  upsertLine(`c-cache-${id}`, h.ts, h.cache,  'Cache Hit %',    '#7c5cd8', 0, 100);
+  const h = d.history || {tps:[],conn:[],cache:[],ts:[]};
+  const ts    = h.ts.slice(-trendWindow);
+  const tps   = h.tps.slice(-trendWindow);
+  const conn  = h.conn.slice(-trendWindow);
+  const cache = h.cache.slice(-trendWindow);
+  upsertLine(`c-tps-${id}`,   ts, tps,   'TPS',            '#4f8ef7');
+  upsertLine(`c-conn-${id}`,  ts, conn,  'Connections',    '#22c55e');
+  upsertLine(`c-cache-${id}`, ts, cache, 'Cache Hit %',    '#7c5cd8', 0, 100);
   if ((d.wait_states||[]).length) {
     upsertPie(`c-wait-${id}`,
       d.wait_states.map(w => (w.wait_event_type||'')+':'+(w.wait_event||'')),
