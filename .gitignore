@@ -3,3 +3,4 @@ __pycache__/
 *.py[cod]
 *.log
 instances.json
+trend_history.sqlite3*

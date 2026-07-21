@@ -382,7 +382,7 @@ tr:hover td { background:var(--row-hover); }
 /* Explain plan overlay */
 #explain-overlay {
   position:fixed; inset:0; background:rgba(0,0,0,.6);
-  display:flex; align-items:center; justify-content:center; z-index:200;
+  display:flex; align-items:center; justify-content:center; z-index:210;
 }
 #explain-overlay.hidden { display:none; }
 #explain-box {
@@ -461,6 +461,20 @@ th.sortable-th { cursor:pointer; user-select:none; white-space:nowrap; }
 th.sortable-th:hover { color:var(--accent) !important; }
 tr.row-clickable { cursor:pointer; }
 tr.row-clickable:hover { background:color-mix(in srgb, var(--accent) 7%, transparent); }
+
+/* Audit log toolbar (search + class filter) */
+.audit-toolbar { display:flex; gap:10px; align-items:center; margin-bottom:10px; flex-wrap:wrap; }
+.audit-search-input {
+  flex:1; min-width:220px; padding:7px 10px; background:var(--bg);
+  border:1px solid var(--border); border-radius:6px; color:var(--text);
+  font-family:var(--font); font-size:13px; outline:none; transition:border-color .15s;
+}
+.audit-search-input:focus { border-color: var(--accent); }
+.audit-class-select {
+  padding:7px 10px; background:var(--bg); border:1px solid var(--border);
+  border-radius:6px; color:var(--text); font-family:var(--font); font-size:13px;
+  cursor:pointer;
+}
 </style>
 </head>
 <body>
@@ -610,12 +624,28 @@ const ACTIVE_TAB_KEY = 'pgdash-active-tab';
 let activePanelTab = localStorage.getItem(ACTIVE_TAB_KEY) || 'overview';
 
 // Trend history is collected server-side (every instance, every 10s,
-// regardless of what's currently on screen) — this just picks how many of
-// the up-to-250 samples the server keeps to actually chart.
-const TREND_WINDOW_KEY     = 'pgdash-trend-window';
-const TREND_WINDOW_OPTIONS = [20, 50, 100, 250];
+// regardless of what's currently on screen). Windows up to
+// EMBEDDED_HISTORY_MAXLEN are sliced straight out of the history already
+// embedded in every /api/metrics poll; anything deeper is fetched on demand
+// from the on-disk trend store (see fetchDeepHistory below) since baking
+// hours of samples into every 10s poll would bloat every response.
+const TREND_WINDOW_KEY = 'pgdash-trend-window';
+const EMBEDDED_HISTORY_MAXLEN = 250;
+const TREND_WINDOW_CHOICES = [
+  { samples: 20,   label: '20 samples (~3 min)'   },
+  { samples: 50,   label: '50 samples (~8 min)'   },
+  { samples: 100,  label: '100 samples (~17 min)' },
+  { samples: 250,  label: '250 samples (~42 min)' },
+  { samples: 720,  label: '2 hours'  },
+  { samples: 4320, label: '12 hours' },
+  { samples: 8640, label: '24 hours' },
+];
+const TREND_WINDOW_OPTIONS = TREND_WINDOW_CHOICES.map(c => c.samples);
 let trendWindow = parseInt(localStorage.getItem(TREND_WINDOW_KEY), 10);
 if (!TREND_WINDOW_OPTIONS.includes(trendWindow)) trendWindow = 20;
+
+const deepHistoryCache   = {}; // "instId:samples" -> {ts,tps,conn,cache}
+const deepHistoryLoading = {}; // "instId:samples" -> true while a fetch is in flight
 
 let autoTimer    = null;
 
@@ -1187,11 +1217,11 @@ function buildPanel(inst, d) {
   h += '</div>';
 
   // ── Trend sparklines ─────────────────────────────────────────
-  h += `<div class="section-title">Trend (last
+  h += `<div class="section-title">Trend (
     <select class="trend-window-select" onchange="setTrendWindow(this.value)">
-      ${TREND_WINDOW_OPTIONS.map(n => `<option value="${n}"${n===trendWindow?' selected':''}>${n}</option>`).join('')}
+      ${TREND_WINDOW_CHOICES.map(c => `<option value="${c.samples}"${c.samples===trendWindow?' selected':''}>${c.label}</option>`).join('')}
     </select>
-    samples · 10 s intervals)</div>`;
+    )</div>`;
   h += '<div class="grid-3">';
   h += `<div class="chart-card"><div class="chart-title">Transactions / Second</div><canvas id="c-tps-${inst.id}"></canvas></div>`;
   h += `<div class="chart-card"><div class="chart-title">Active Connections</div><canvas id="c-conn-${inst.id}"></canvas></div>`;
@@ -1361,11 +1391,17 @@ function buildPanel(inst, d) {
 
   h4 += '<div style="height:32px"></div>';
 
+  // ============================================================
+  // Tab 5 — Audit Logs
+  // ============================================================
+  const h5 = buildAuditLogPanel(inst.id, d.pgaudit);
+
   const TABS = [
     { id: 'host',            label: 'Host Statistics',          html: h3 },
     { id: 'overview',        label: 'Database Overview',        html: hOverview },
     { id: 'query',           label: 'Query Statistics',         html: h4 },
     { id: 'recommendations', label: 'Database Recommendations', html: h2 },
+    { id: 'audit',           label: 'Audit Logs',               html: h5 },
   ];
 
   let out = '<div class="tabs-bar">';
@@ -1377,6 +1413,157 @@ function buildPanel(inst, d) {
     out += `<div class="tab-panel" data-tab="${t.id}"${activePanelTab===t.id?'':' style="display:none"'}>${t.html}</div>`;
   });
   return out;
+}
+
+// ============================================================
+// Audit Log panel (pgaudit) — status/config card + illustrative
+// searchable/sortable/filterable log-entries table.
+//
+// pgaudit writes to the server log, not a queryable table, so there's no
+// live entry feed available from a plain DB connection regardless of
+// whether it's enabled. The table below is illustrative example data (same
+// "no live data yet" pattern as the Query Advisor panel) that demonstrates
+// the exact interaction — search, class filter, column sort — the UI would
+// offer once a real log source is wired in.
+// ============================================================
+const AUDIT_LOG_EXAMPLES = [
+  { ts: '2026-07-21 09:12:04 UTC', user: 'app_svc',    db: 'orders',    class: 'WRITE',    command: 'UPDATE',      object: 'public.orders',        statement: "UPDATE orders SET status = 'shipped' WHERE id = 48213" },
+  { ts: '2026-07-21 09:11:58 UTC', user: 'app_svc',    db: 'orders',    class: 'READ',     command: 'SELECT',      object: 'public.customers',     statement: 'SELECT * FROM customers WHERE id = $1' },
+  { ts: '2026-07-21 09:10:41 UTC', user: 'reporting',  db: 'analytics', class: 'READ',     command: 'SELECT',      object: 'public.revenue_daily', statement: 'SELECT sum(amount) FROM revenue_daily WHERE day = current_date' },
+  { ts: '2026-07-21 09:08:15 UTC', user: 'dba_alice',  db: 'orders',    class: 'DDL',      command: 'ALTER TABLE', object: 'public.orders',        statement: 'ALTER TABLE orders ADD COLUMN priority int' },
+  { ts: '2026-07-21 09:05:52 UTC', user: 'dba_alice',  db: 'postgres',  class: 'ROLE',     command: 'GRANT',       object: 'app_svc',               statement: 'GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_svc' },
+  { ts: '2026-07-21 09:03:37 UTC', user: 'app_svc',    db: 'orders',    class: 'WRITE',    command: 'DELETE',      object: 'public.sessions',      statement: 'DELETE FROM sessions WHERE expires_at < now()' },
+  { ts: '2026-07-21 09:01:22 UTC', user: 'app_svc',    db: 'orders',    class: 'FUNCTION', command: 'EXECUTE',     object: 'public.recalc_totals',  statement: 'SELECT recalc_totals(48213)' },
+  { ts: '2026-07-21 08:59:09 UTC', user: 'monitoring', db: 'postgres',  class: 'MISC',     command: 'SHOW',        object: '—',                     statement: 'SHOW server_version' },
+];
+
+const auditLogState = {}; // instId -> {search, cls, sort:{col,dir}}
+
+const AUDIT_LOG_COLS = [
+  { key: 'ts',        label: 'Time'      },
+  { key: 'user',      label: 'User'      },
+  { key: 'db',        label: 'DB'        },
+  { key: 'class',     label: 'Class'     },
+  { key: 'command',   label: 'Command'   },
+  { key: 'object',    label: 'Object'    },
+  { key: 'statement', label: 'Statement' },
+];
+
+function getAuditLogState(instId) {
+  return auditLogState[instId] || (auditLogState[instId] = { search: '', cls: '', sort: { col: 'ts', dir: 'desc' } });
+}
+
+function buildAuditLogPanel(instId, pgaudit) {
+  let h = '<div class="section-title">Audit Logging <small style="font-size:11px;color:var(--muted);font-weight:400">(pgaudit extension)</small></div>';
+
+  if (!pgaudit) {
+    h += `<div class="card" style="color:var(--muted);text-align:center;padding:28px 16px">
+      Could not read pgaudit status for this instance.
+    </div>`;
+  } else if (pgaudit.error) {
+    h += `<div class="card" style="color:var(--red);padding:16px"><b>Error:</b> ${escHtml(pgaudit.error)}</div>`;
+  } else if (!pgaudit.available && !pgaudit.preloaded) {
+    h += `<div class="card" style="color:var(--muted);text-align:center;padding:28px 16px">
+      <code>pgaudit</code> is not available on this server.<br>
+      <span style="font-size:11px;margin-top:6px;display:block">Install the pgaudit package for this PostgreSQL version to enable it.</span>
+    </div>`;
+  } else if (!pgaudit.preloaded) {
+    h += `<div class="card" style="color:var(--muted);text-align:center;padding:28px 16px">
+      <code>pgaudit</code> is installed but not loaded.
+      <span style="font-size:11px;margin-top:6px;display:block">
+        It needs to be added to <code>shared_preload_libraries</code> and the server restarted before it can log anything.
+      </span></div>`;
+  } else {
+    const settingRows = Object.entries(pgaudit.settings || {}).map(([name, setting]) => ({ name, setting }));
+    h += `<div style="margin-bottom:14px;padding:10px 14px;border-radius:8px;
+        background:color-mix(in srgb, var(--accent) ${pgaudit.enabled?8:14}%, var(--card));
+        border:1px solid ${pgaudit.enabled?'var(--accent)':'var(--amber)'};color:${pgaudit.enabled?'var(--accent2)':'var(--amber)'};font-size:13px">
+      ${pgaudit.enabled
+        ? 'ℹ pgaudit is loaded and actively logging (pgaudit.log = ' + escHtml(pgaudit.settings['pgaudit.log']||'') + ').'
+        : '⚠ pgaudit is loaded but not currently logging anything — <code>pgaudit.log</code> is set to "none".'}
+    </div>`;
+    h += '<div class="card"><div class="kv-list">';
+    settingRows.forEach(s => {
+      h += `<span class="kv-key">${escHtml(s.name)}</span><span class="kv-val">${escHtml(s.setting)}</span>`;
+    });
+    h += '</div></div>';
+  }
+
+  h += '<div class="section-title" style="margin-top:28px">Log Entries</div>';
+  h += `<div style="margin-bottom:14px;padding:10px 14px;border-radius:8px;
+      background:color-mix(in srgb, var(--accent) 8%, var(--card));border:1px solid var(--accent);color:var(--accent2);font-size:13px">
+    ℹ pgaudit writes to the server log, not a database table, so live entries aren't queryable from here yet.
+    Showing <b>illustrative example entries</b> — search, filter, and sort work the same once a real log source is wired in.
+  </div>`;
+  h += `<div id="auditlog-wrap-${instId}">${renderAuditLogTable(instId)}</div>`;
+  return h;
+}
+
+function renderAuditLogTable(instId) {
+  const st = getAuditLogState(instId);
+  const search = st.search.trim().toLowerCase();
+  let rows = AUDIT_LOG_EXAMPLES.filter(r => {
+    if (st.cls && r.class !== st.cls) return false;
+    if (!search) return true;
+    return Object.values(r).some(v => String(v).toLowerCase().includes(search));
+  });
+  rows = sortRows(rows, st.sort);
+
+  const classes = [...new Set(AUDIT_LOG_EXAMPLES.map(r => r.class))].sort();
+
+  let h = '<div class="audit-toolbar">';
+  h += `<input class="audit-search-input" placeholder="Search user, db, object, statement…"
+          value="${escAttr(st.search)}" oninput="setAuditLogSearch('${escAttr(instId)}', this.value)">`;
+  h += `<select class="audit-class-select" onchange="setAuditLogClass('${escAttr(instId)}', this.value)">
+    <option value="">All classes</option>
+    ${classes.map(c => `<option value="${escAttr(c)}"${st.cls===c?' selected':''}>${escHtml(c)}</option>`).join('')}
+  </select>`;
+  h += `<span style="font-size:12px;color:var(--muted)">${rows.length} of ${AUDIT_LOG_EXAMPLES.length}</span>`;
+  h += '</div>';
+
+  h += '<div class="card"><div class="tbl-wrap"><table><thead>';
+  h += sortableHeaderRow(AUDIT_LOG_COLS, st.sort, 'resortAuditLog', instId);
+  h += '</thead><tbody>';
+  if (!rows.length) {
+    h += `<tr><td colspan="${AUDIT_LOG_COLS.length}" style="color:var(--muted);text-align:center;padding:16px">No matching entries.</td></tr>`;
+  }
+  rows.forEach(r => {
+    h += `<tr>
+      <td style="white-space:nowrap">${escHtml(r.ts)}</td>
+      <td>${escHtml(r.user)}</td><td>${escHtml(r.db)}</td>
+      <td><span class="badge badge-blue">${escHtml(r.class)}</span></td>
+      <td>${escHtml(r.command)}</td><td>${escHtml(r.object)}</td>
+      <td><code style="font-size:11px;word-break:break-all">${escHtml(r.statement)}</code></td>
+    </tr>`;
+  });
+  h += '</tbody></table></div></div>';
+  return h;
+}
+
+// Re-rendering the wrapper on every keystroke replaces the input node, which
+// would otherwise drop keyboard focus after a single character — restore it
+// (cursor at the end) so typing a search term actually works.
+function setAuditLogSearch(instId, value) {
+  getAuditLogState(instId).search = value;
+  const wrap = document.getElementById('auditlog-wrap-' + instId);
+  if (!wrap) return;
+  wrap.innerHTML = renderAuditLogTable(instId);
+  const inp = wrap.querySelector('.audit-search-input');
+  if (inp) { inp.focus(); const p = inp.value.length; inp.setSelectionRange(p, p); }
+}
+
+function setAuditLogClass(instId, value) {
+  getAuditLogState(instId).cls = value;
+  const wrap = document.getElementById('auditlog-wrap-' + instId);
+  if (wrap) wrap.innerHTML = renderAuditLogTable(instId);
+}
+
+function resortAuditLog(instId, col) {
+  const st = getAuditLogState(instId);
+  st.sort.dir = (st.sort.col === col && st.sort.dir === 'desc') ? 'asc' : 'desc';
+  st.sort.col = col;
+  const wrap = document.getElementById('auditlog-wrap-' + instId);
+  if (wrap) wrap.innerHTML = renderAuditLogTable(instId);
 }
 
 // ============================================================
@@ -1936,11 +2123,17 @@ async function showBenefitedQueries(instId, queryidsJson) {
       body.innerHTML = '<p style="color:var(--muted)">None of these queries were found in pg_stat_statements — they may have aged out.</p>';
       return;
     }
-    let h = '<div class="tbl-wrap"><table><thead><tr>'
+    let h = '<p style="font-size:12px;color:var(--muted);margin-bottom:8px">'
+      + 'Click a query to see its current execution plan — the cost this index recommendation is meant to reduce.</p>';
+    h += '<div class="tbl-wrap"><table><thead><tr>'
       + '<th>Query</th><th>Calls</th><th>Total ms</th><th>Mean ms</th>'
       + '</tr></thead><tbody>';
     rows.forEach(q => {
-      h += `<tr>
+      const explainable = isExplainable(q.query);
+      const rowAttrs = explainable
+        ? `class="row-clickable" title="Click to view execution plan" onclick="explainQuery('${escAttr(instId)}','${escAttr(q.queryid)}','pg_stat_statements')"`
+        : `title="Execution plan not applicable for this statement type"`;
+      h += `<tr ${rowAttrs}>
         <td><code style="font-size:11px;word-break:break-all">${escHtml(q.query||'')}</code></td>
         <td>${fmtNum(q.calls)}</td><td>${fmtNum(q.total_ms)}</td><td>${fmtNum(q.mean_ms)}</td>
       </tr>`;
@@ -2073,8 +2266,40 @@ function setTrendWindow(n) {
   renderContent();
 }
 
+// Windows beyond what's embedded in /api/metrics are fetched from the
+// on-disk trend store on demand and cached; drawCharts triggers the fetch
+// and re-renders once it lands (same fire-and-forget pattern as the other
+// modals in this file).
+async function fetchDeepHistory(instId, samples) {
+  const key = instId + ':' + samples;
+  if (deepHistoryLoading[key]) return;
+  deepHistoryLoading[key] = true;
+  try {
+    const r = await fetch(`/api/instances/${encodeURIComponent(instId)}/trend-history?samples=${samples}`);
+    const data = await r.json();
+    if (r.ok && !data.error) {
+      deepHistoryCache[key] = data;
+      if (activeId === instId && trendWindow === samples) renderContent();
+    }
+  } catch (e) {
+    // leave uncached — the chart just stays empty until the next attempt
+  } finally {
+    delete deepHistoryLoading[key];
+  }
+}
+
 function drawCharts(id, d) {
-  const h = d.history || {tps:[],conn:[],cache:[],ts:[]};
+  let h;
+  if (trendWindow > EMBEDDED_HISTORY_MAXLEN) {
+    const key = id + ':' + trendWindow;
+    h = deepHistoryCache[key];
+    if (!h) {
+      fetchDeepHistory(id, trendWindow);
+      h = { ts: [], tps: [], conn: [], cache: [] };
+    }
+  } else {
+    h = d.history || {tps:[],conn:[],cache:[],ts:[]};
+  }
   const ts    = h.ts.slice(-trendWindow);
   const tps   = h.tps.slice(-trendWindow);
   const conn  = h.conn.slice(-trendWindow);

@@ -6,6 +6,7 @@ Flask backend — dynamic instance list with add/remove API.
 import json
 import os
 import re
+import sqlite3
 import time
 import threading
 import traceback
@@ -80,6 +81,102 @@ HISTORY_MAXLEN = 250
 _history = {}       # instance_id -> {"ts": deque, "tps": deque, "conn": deque, "cache": deque}
 _prev_xact = {}      # instance_id -> (monotonic_time, cumulative xact_commit+xact_rollback)
 _history_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Trend history — on-disk backing store (SQLite)
+#
+# The in-memory deques above are just a hot cache capped at HISTORY_MAXLEN
+# samples (~42 min at the 10s poll interval) and lost on restart. Every
+# sample is also persisted here so trends survive a restart and so the UI
+# can request a much longer look-back (hours) without bloating the payload
+# of every /api/metrics poll.
+# ---------------------------------------------------------------------------
+TREND_DB_PATH = Path(__file__).parent / "trend_history.sqlite3"
+TREND_RETENTION_SAMPLES = 8640  # 24h at a 10s poll interval, per instance
+_trend_db_lock = threading.Lock()
+
+
+def _trend_db_connect():
+    conn = sqlite3.connect(TREND_DB_PATH, timeout=5)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def init_trend_db():
+    with _trend_db_lock:
+        conn = _trend_db_connect()
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS trend_samples (
+                    instance_id TEXT NOT NULL,
+                    ts          TEXT NOT NULL,
+                    tps         REAL,
+                    conn        INTEGER,
+                    cache       REAL
+                )
+            """)
+            # rowid itself can't appear in an index's column list (it's
+            # already implicit in every index) — indexing instance_id alone
+            # is enough since ORDER BY rowid / DELETE ... NOT IN (...) still
+            # use SQLite's native rowid ordering.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_trend_samples_inst ON trend_samples(instance_id)"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def record_trend_sample(inst_id, ts_iso, tps, conn_count, cache_hit):
+    with _trend_db_lock:
+        conn = _trend_db_connect()
+        try:
+            conn.execute(
+                "INSERT INTO trend_samples (instance_id, ts, tps, conn, cache) VALUES (?, ?, ?, ?, ?)",
+                (inst_id, ts_iso, tps, conn_count, cache_hit),
+            )
+            # Keep only the most recent TREND_RETENTION_SAMPLES rows per instance.
+            conn.execute(
+                "DELETE FROM trend_samples WHERE instance_id = ? AND rowid NOT IN "
+                "(SELECT rowid FROM trend_samples WHERE instance_id = ? ORDER BY rowid DESC LIMIT ?)",
+                (inst_id, inst_id, TREND_RETENTION_SAMPLES),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def load_trend_history(inst_id, samples):
+    """Most recent `samples` rows for one instance, oldest first."""
+    with _trend_db_lock:
+        conn = _trend_db_connect()
+        try:
+            cur = conn.execute(
+                "SELECT ts, tps, conn, cache FROM trend_samples "
+                "WHERE instance_id = ? ORDER BY rowid DESC LIMIT ?",
+                (inst_id, samples),
+            )
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+    return list(reversed(rows))
+
+
+def delete_trend_history(inst_id):
+    with _trend_db_lock:
+        conn = _trend_db_connect()
+        try:
+            conn.execute("DELETE FROM trend_samples WHERE instance_id = ?", (inst_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _short_time(ts_iso):
+    try:
+        return datetime.fromisoformat(ts_iso).strftime("%H:%M:%S")
+    except Exception:
+        return ts_iso
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +441,10 @@ def collect_instance(inst):
              "ROUND(estimated_pct_cost_reduction::numeric,1) AS est_cost_reduction_pct, "
              "ROUND(abs_benefit::numeric,2) AS abs_benefit, "
              "COALESCE(array_length(benefited_queryids,1),0) AS benefited_queries, "
-             "benefited_queryids "
+             # Cast to text[] — these are bigint queryids (~1e18), and round-tripping
+             # them through JSON as numbers silently corrupts them once a browser's
+             # JS parses them (doubles only carry 53 bits of integer precision).
+             "benefited_queryids::text[] AS benefited_queryids "
              "FROM query_advisor_index_recommendations() "
              "ORDER BY estimated_pct_cost_reduction DESC LIMIT 10"),
         ]:
@@ -420,6 +520,29 @@ def collect_instance(inst):
         else:
             result["pg_tuner"] = None       # extension not installed
 
+        # --- pgaudit (Tab 5: Audit Logs) ------------------------------------
+        # pgaudit's GUCs only exist in pg_settings once it's in
+        # shared_preload_libraries — their presence is how we tell "preloaded"
+        # apart from merely "available to install". pgaudit itself writes to
+        # the server log, not a table, so there's no live entries to query
+        # here regardless of whether it's enabled.
+        try:
+            avail     = scalar(conn, "SELECT 1 FROM pg_available_extensions WHERE name = 'pgaudit'")
+            installed = scalar(conn, "SELECT 1 FROM pg_extension WHERE extname = 'pgaudit'")
+            setting_rows = query(conn,
+                "SELECT name, setting FROM pg_settings WHERE name LIKE 'pgaudit.%' ORDER BY name")
+            settings = {r["name"]: r["setting"] for r in setting_rows}
+            log_setting = (settings.get("pgaudit.log") or "").strip().lower()
+            result["pgaudit"] = {
+                "available": bool(avail),
+                "installed": bool(installed),
+                "preloaded": bool(setting_rows),
+                "enabled":   bool(log_setting) and log_setting != "none",
+                "settings":  settings,
+            }
+        except Exception as e:
+            result["pgaudit"] = {"error": str(e)}
+
         # --- Tablespaces ---------------------------------------------------
         result["tablespaces"] = query(conn, """
             SELECT spcname,
@@ -466,12 +589,22 @@ def collect_and_record(inst):
     result = collect_instance(inst)
     inst_id = inst["id"]
     with _history_lock:
-        h = _history.setdefault(inst_id, {
-            "ts":    deque(maxlen=HISTORY_MAXLEN),
-            "tps":   deque(maxlen=HISTORY_MAXLEN),
-            "conn":  deque(maxlen=HISTORY_MAXLEN),
-            "cache": deque(maxlen=HISTORY_MAXLEN),
-        })
+        h = _history.get(inst_id)
+        if h is None:
+            # First time this instance is seen in this process — prime the
+            # in-memory cache from disk so a restart doesn't blank the charts.
+            h = {
+                "ts":    deque(maxlen=HISTORY_MAXLEN),
+                "tps":   deque(maxlen=HISTORY_MAXLEN),
+                "conn":  deque(maxlen=HISTORY_MAXLEN),
+                "cache": deque(maxlen=HISTORY_MAXLEN),
+            }
+            for ts_iso, tps_v, conn_v, cache_v in load_trend_history(inst_id, HISTORY_MAXLEN):
+                h["ts"].append(_short_time(ts_iso))
+                h["tps"].append(tps_v)
+                h["conn"].append(conn_v)
+                h["cache"].append(cache_v)
+            _history[inst_id] = h
         if not result.get("error"):
             # TPS as a live rate: delta cumulative xacts / delta wall time
             # since the previous poll. Falls back to 0 on the first sample
@@ -489,10 +622,14 @@ def collect_and_record(inst):
             _prev_xact[inst_id] = (now_m, xact_total)
             result["tps"] = tps
 
-            h["ts"].append(datetime.now(timezone.utc).strftime("%H:%M:%S"))
+            now_dt = datetime.now(timezone.utc)
+            conn_total = (result.get("connections") or {}).get("total") or 0
+            cache_hit = _avg_cache_hit(result.get("databases") or [])
+            h["ts"].append(now_dt.strftime("%H:%M:%S"))
             h["tps"].append(tps)
-            h["conn"].append((result.get("connections") or {}).get("total") or 0)
-            h["cache"].append(_avg_cache_hit(result.get("databases") or []))
+            h["conn"].append(conn_total)
+            h["cache"].append(cache_hit)
+            record_trend_sample(inst_id, now_dt.isoformat(), tps, conn_total, cache_hit)
         result["history"] = {k: list(v) for k, v in h.items()}
     return result
 
@@ -600,6 +737,7 @@ def api_remove_instance(instance_id):
     with _history_lock:
         _history.pop(instance_id, None)
         _prev_xact.pop(instance_id, None)
+    delete_trend_history(instance_id)
 
     return jsonify({"ok": True})
 
@@ -721,7 +859,8 @@ def api_index_recommendation_queries(instance_id):
     try:
         rows = query(
             conn,
-            "SELECT queryid, query, calls, ROUND(total_exec_time::numeric,2) AS total_ms, "
+            "SELECT queryid::text AS queryid, query, calls, "
+            "ROUND(total_exec_time::numeric,2) AS total_ms, "
             "ROUND(mean_exec_time::numeric,2) AS mean_ms "
             "FROM pg_stat_statements WHERE queryid = ANY(%s::bigint[]) "
             "ORDER BY total_exec_time DESC",
@@ -835,6 +974,34 @@ def api_metrics_instance(instance_id):
     return jsonify(data)
 
 
+@app.route("/api/instances/<instance_id>/trend-history")
+def api_trend_history(instance_id):
+    """Longer trend look-back than the HISTORY_MAXLEN embedded in every
+    /api/metrics poll, read from the on-disk sample store. Timestamps are
+    formatted with a date component since a multi-hour window can cross
+    midnight, unlike the short in-memory history's bare HH:MM:SS."""
+    try:
+        samples = int(request.args.get("samples", HISTORY_MAXLEN))
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid samples"}), 400
+    samples = max(1, min(samples, TREND_RETENTION_SAMPLES))
+
+    rows = load_trend_history(instance_id, samples)
+    return jsonify({
+        "ts":    [_fmt_deep_ts(r[0]) for r in rows],
+        "tps":   [r[1] for r in rows],
+        "conn":  [r[2] for r in rows],
+        "cache": [r[3] for r in rows],
+    })
+
+
+def _fmt_deep_ts(ts_iso):
+    try:
+        return datetime.fromisoformat(ts_iso).strftime("%m/%d %H:%M")
+    except Exception:
+        return ts_iso
+
+
 # ---------------------------------------------------------------------------
 # Static files
 # ---------------------------------------------------------------------------
@@ -864,6 +1031,8 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=5000)
     args = parser.parse_args()
 
+    print("Initializing trend history store …")
+    init_trend_db()
     print("Initial data collection …")
     refresh_all()
     print("Starting background refresh thread …")
