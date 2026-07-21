@@ -3,6 +3,9 @@ PostgreSQL Multi-Instance Dashboard
 Flask backend — dynamic instance list with add/remove API.
 """
 
+import csv
+import decimal
+import io
 import json
 import os
 import re
@@ -13,7 +16,7 @@ import traceback
 import urllib.request
 import uuid
 from collections import deque
-from datetime import datetime, timezone
+from datetime import date, datetime, time as dt_time, timezone
 from pathlib import Path
 
 import psycopg2
@@ -251,6 +254,32 @@ def find_newer_pg_version(version_short):
     if lm and int(lm.group(1)) > minor:
         return latest
     return None
+
+
+def _parse_pgaudit_message(message):
+    """pgaudit's log line is CSV-ish: AUDIT_TYPE,STATEMENT_ID,SUBSTATEMENT_ID,
+    CLASS,COMMAND,OBJECT_TYPE,OBJECT_NAME,STATEMENT,PARAMETER — with CSV
+    quoting for any field (usually STATEMENT) containing a comma or newline,
+    prefixed with "AUDIT: ". Returns None if it doesn't match that shape, so
+    callers can fall back to showing the raw message untouched.
+    """
+    prefix = "AUDIT: "
+    if not message or not message.startswith(prefix):
+        return None
+    try:
+        fields = next(csv.reader(io.StringIO(message[len(prefix):])))
+    except Exception:
+        return None
+    if len(fields) < 9:
+        return None
+    return {
+        "class":       fields[3],
+        "command":     fields[4],
+        "object_type": fields[5],
+        "object":      fields[6],
+        "statement":   fields[7],
+        "parameter":   fields[8],
+    }
 
 
 def collect_instance(inst):
@@ -523,9 +552,10 @@ def collect_instance(inst):
         # --- pgaudit (Tab 5: Audit Logs) ------------------------------------
         # pgaudit's GUCs only exist in pg_settings once it's in
         # shared_preload_libraries — their presence is how we tell "preloaded"
-        # apart from merely "available to install". pgaudit itself writes to
-        # the server log, not a table, so there's no live entries to query
-        # here regardless of whether it's enabled.
+        # apart from merely "available to install". Community pgaudit writes
+        # to the server log, not a table; EDB Advanced/Extended Server also
+        # mirrors entries into edb_internals.pgaudit_log, which is queried
+        # separately below.
         try:
             avail     = scalar(conn, "SELECT 1 FROM pg_available_extensions WHERE name = 'pgaudit'")
             installed = scalar(conn, "SELECT 1 FROM pg_extension WHERE extname = 'pgaudit'")
@@ -540,6 +570,22 @@ def collect_instance(inst):
                 "enabled":   bool(log_setting) and log_setting != "none",
                 "settings":  settings,
             }
+            # EDB Postgres Advanced/Extended Server audits to a real table
+            # (edb_internals.pgaudit_log) rather than the server log — pull
+            # recent entries when it's present. Nested try so its absence on
+            # community Postgres doesn't blank out the settings above.
+            try:
+                log_rows = query(conn, """
+                    SELECT log_time::text AS log_time, user_name, command_tag, message
+                    FROM edb_internals.pgaudit_log
+                    ORDER BY log_time DESC
+                    LIMIT 500
+                """)
+                for r in log_rows:
+                    r["parsed"] = _parse_pgaudit_message(r["message"])
+                result["pgaudit"]["log_entries"] = log_rows
+            except Exception:
+                result["pgaudit"]["log_entries"] = None
         except Exception as e:
             result["pgaudit"] = {"error": str(e)}
 
@@ -950,6 +996,76 @@ def api_database_schema(instance_id):
         return jsonify({"schemas": schemas, "tables": tables})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+SQL_CONSOLE_ROW_LIMIT = 1000
+
+
+def _jsonable(v):
+    """Coerce a psycopg2 result value into something jsonify can serialize
+    without mangling it — dates/times as ISO text, Decimal as float, raw
+    binary as hex, rather than relying on Flask's generic fallback."""
+    if isinstance(v, (datetime, date, dt_time)):
+        return v.isoformat()
+    if isinstance(v, decimal.Decimal):
+        return float(v)
+    if isinstance(v, (bytes, bytearray, memoryview)):
+        return bytes(v).hex()
+    if isinstance(v, uuid.UUID):
+        return str(v)
+    return v
+
+
+@app.route("/api/instances/<instance_id>/sql", methods=["POST"])
+def api_run_sql(instance_id):
+    """Lightweight SQL console — run arbitrary SQL against one database on
+    this instance (like a browser-based psql) and return either the result
+    set or a rowcount/status. One connection per request, autocommit, no
+    session state across calls — same trust model as the EXPLAIN/schema
+    endpoints above, which already run admin-supplied SQL text.
+    """
+    body = request.get_json(force=True) or {}
+    sql = (body.get("sql") or "").strip()
+    dbname = body.get("dbname")
+    if not sql:
+        return jsonify({"error": "missing sql"}), 400
+
+    inst = next((i for i in get_instances() if i["id"] == instance_id), None)
+    if not inst:
+        return jsonify({"error": "unknown instance"}), 404
+
+    target = dict(inst, dbname=dbname) if dbname else inst
+    try:
+        conn = psycopg2.connect(make_dsn(target))
+        conn.autocommit = True
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    try:
+        started = time.time()
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            elapsed_ms = round((time.time() - started) * 1000, 1)
+            if cur.description is not None:
+                cols = [d.name for d in cur.description]
+                raw_rows = cur.fetchmany(SQL_CONSOLE_ROW_LIMIT + 1)
+                truncated = len(raw_rows) > SQL_CONSOLE_ROW_LIMIT
+                raw_rows = raw_rows[:SQL_CONSOLE_ROW_LIMIT]
+                rows = [[_jsonable(v) for v in row] for row in raw_rows]
+                return jsonify({
+                    "columns": cols, "rows": rows, "row_count": len(rows),
+                    "truncated": truncated, "elapsed_ms": elapsed_ms,
+                    "status": cur.statusmessage,
+                })
+            return jsonify({
+                "columns": None, "rows": [], "row_count": cur.rowcount,
+                "truncated": False, "elapsed_ms": elapsed_ms,
+                "status": cur.statusmessage,
+            })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
     finally:
         conn.close()
 

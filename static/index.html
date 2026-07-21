@@ -475,6 +475,16 @@ tr.row-clickable:hover { background:color-mix(in srgb, var(--accent) 7%, transpa
   border-radius:6px; color:var(--text); font-family:var(--font); font-size:13px;
   cursor:pointer;
 }
+
+/* SQL console */
+.sql-console-toolbar { display:flex; gap:10px; align-items:center; margin-bottom:10px; flex-wrap:wrap; }
+.sql-console-textarea {
+  width:100%; min-height:130px; padding:10px 12px; background:var(--bg);
+  border:1px solid var(--border); border-radius:6px; color:var(--text);
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:13px;
+  line-height:1.5; outline:none; resize:vertical; transition:border-color .15s;
+}
+.sql-console-textarea:focus { border-color: var(--accent); }
 </style>
 </head>
 <body>
@@ -1394,7 +1404,12 @@ function buildPanel(inst, d) {
   // ============================================================
   // Tab 5 — Audit Logs
   // ============================================================
-  const h5 = buildAuditLogPanel(inst.id, d.pgaudit);
+  const h5 = buildAuditLogPanel(inst.id, d.pgaudit, d.dbname);
+
+  // ============================================================
+  // Tab 6 — SQL Console
+  // ============================================================
+  const h6 = buildSqlConsolePanel(inst, d.databases);
 
   const TABS = [
     { id: 'host',            label: 'Host Statistics',          html: h3 },
@@ -1402,6 +1417,7 @@ function buildPanel(inst, d) {
     { id: 'query',           label: 'Query Statistics',         html: h4 },
     { id: 'recommendations', label: 'Database Recommendations', html: h2 },
     { id: 'audit',           label: 'Audit Logs',               html: h5 },
+    { id: 'sql',             label: 'SQL Console',              html: h6 },
   ];
 
   let out = '<div class="tabs-bar">';
@@ -1449,11 +1465,34 @@ const AUDIT_LOG_COLS = [
   { key: 'statement', label: 'Statement' },
 ];
 
+// edb_internals.pgaudit_log (EDB Postgres Advanced/Extended Server) logs to
+// a real table — log_time, user_name, command_tag, message — instead of the
+// server log community pgaudit uses. The backend already CSV-parses
+// `message` (pgaudit's own line format: AUDIT_TYPE,STATEMENT_ID,
+// SUBSTATEMENT_ID,CLASS,COMMAND,OBJECT_TYPE,OBJECT_NAME,STATEMENT,PARAMETER)
+// into r.parsed, so class/object line up with the same columns the
+// illustrative example uses — only db falls back to the instance's
+// connected database, since the table itself doesn't carry one.
+function mapEdbAuditRows(rows, dbname) {
+  return rows.map(r => {
+    const p = r.parsed;
+    return {
+      ts: r.log_time, user: r.user_name, db: dbname || '',
+      class: p ? p.class : '',
+      command: p ? p.command : r.command_tag,
+      object: p ? [p.object_type, p.object].filter(Boolean).join(': ') : '',
+      statement: p ? p.statement : r.message,
+    };
+  });
+}
+
+const auditLogRows = {}; // instId -> {rows, cols, isReal}
+
 function getAuditLogState(instId) {
   return auditLogState[instId] || (auditLogState[instId] = { search: '', cls: '', sort: { col: 'ts', dir: 'desc' } });
 }
 
-function buildAuditLogPanel(instId, pgaudit) {
+function buildAuditLogPanel(instId, pgaudit, dbname) {
   let h = '<div class="section-title">Audit Logging <small style="font-size:11px;color:var(--muted);font-weight:400">(pgaudit extension)</small></div>';
 
   if (!pgaudit) {
@@ -1489,52 +1528,65 @@ function buildAuditLogPanel(instId, pgaudit) {
     h += '</div></div>';
   }
 
+  const hasRealLog = Array.isArray(pgaudit && pgaudit.log_entries);
+  const rows = hasRealLog ? mapEdbAuditRows(pgaudit.log_entries, dbname) : AUDIT_LOG_EXAMPLES;
+  auditLogRows[instId] = { rows, cols: AUDIT_LOG_COLS, isReal: hasRealLog };
+
   h += '<div class="section-title" style="margin-top:28px">Log Entries</div>';
-  h += `<div style="margin-bottom:14px;padding:10px 14px;border-radius:8px;
-      background:color-mix(in srgb, var(--accent) 8%, var(--card));border:1px solid var(--accent);color:var(--accent2);font-size:13px">
-    ℹ pgaudit writes to the server log, not a database table, so live entries aren't queryable from here yet.
-    Showing <b>illustrative example entries</b> — search, filter, and sort work the same once a real log source is wired in.
-  </div>`;
+  h += hasRealLog
+    ? `<div style="margin-bottom:14px;padding:10px 14px;border-radius:8px;
+        background:color-mix(in srgb, var(--accent) 8%, var(--card));border:1px solid var(--accent);color:var(--accent2);font-size:13px">
+      ℹ Showing the ${rows.length} most recent entries from <code>edb_internals.pgaudit_log</code> (EDB Postgres audit log table).
+    </div>`
+    : `<div style="margin-bottom:14px;padding:10px 14px;border-radius:8px;
+        background:color-mix(in srgb, var(--accent) 8%, var(--card));border:1px solid var(--accent);color:var(--accent2);font-size:13px">
+      ℹ pgaudit writes to the server log, not a database table, so live entries aren't queryable from here yet.
+      Showing <b>illustrative example entries</b> — search, filter, and sort work the same once a real log source is wired in.
+    </div>`;
   h += `<div id="auditlog-wrap-${instId}">${renderAuditLogTable(instId)}</div>`;
   return h;
 }
 
 function renderAuditLogTable(instId) {
   const st = getAuditLogState(instId);
+  const src = auditLogRows[instId] || { rows: AUDIT_LOG_EXAMPLES, cols: AUDIT_LOG_COLS, isReal: false };
   const search = st.search.trim().toLowerCase();
-  let rows = AUDIT_LOG_EXAMPLES.filter(r => {
+  let rows = src.rows.filter(r => {
     if (st.cls && r.class !== st.cls) return false;
     if (!search) return true;
     return Object.values(r).some(v => String(v).toLowerCase().includes(search));
   });
   rows = sortRows(rows, st.sort);
 
-  const classes = [...new Set(AUDIT_LOG_EXAMPLES.map(r => r.class))].sort();
+  const classes = [...new Set(src.rows.map(r => r.class).filter(Boolean))].sort();
 
   let h = '<div class="audit-toolbar">';
   h += `<input class="audit-search-input" placeholder="Search user, db, object, statement…"
           value="${escAttr(st.search)}" oninput="setAuditLogSearch('${escAttr(instId)}', this.value)">`;
-  h += `<select class="audit-class-select" onchange="setAuditLogClass('${escAttr(instId)}', this.value)">
-    <option value="">All classes</option>
-    ${classes.map(c => `<option value="${escAttr(c)}"${st.cls===c?' selected':''}>${escHtml(c)}</option>`).join('')}
-  </select>`;
-  h += `<span style="font-size:12px;color:var(--muted)">${rows.length} of ${AUDIT_LOG_EXAMPLES.length}</span>`;
+  if (classes.length) {
+    h += `<select class="audit-class-select" onchange="setAuditLogClass('${escAttr(instId)}', this.value)">
+      <option value="">All classes</option>
+      ${classes.map(c => `<option value="${escAttr(c)}"${st.cls===c?' selected':''}>${escHtml(c)}</option>`).join('')}
+    </select>`;
+  }
+  h += `<span style="font-size:12px;color:var(--muted)">${rows.length} of ${src.rows.length}</span>`;
   h += '</div>';
 
   h += '<div class="card"><div class="tbl-wrap"><table><thead>';
-  h += sortableHeaderRow(AUDIT_LOG_COLS, st.sort, 'resortAuditLog', instId);
+  h += sortableHeaderRow(src.cols, st.sort, 'resortAuditLog', instId);
   h += '</thead><tbody>';
   if (!rows.length) {
-    h += `<tr><td colspan="${AUDIT_LOG_COLS.length}" style="color:var(--muted);text-align:center;padding:16px">No matching entries.</td></tr>`;
+    h += `<tr><td colspan="${src.cols.length}" style="color:var(--muted);text-align:center;padding:16px">No matching entries.</td></tr>`;
   }
   rows.forEach(r => {
-    h += `<tr>
-      <td style="white-space:nowrap">${escHtml(r.ts)}</td>
-      <td>${escHtml(r.user)}</td><td>${escHtml(r.db)}</td>
-      <td><span class="badge badge-blue">${escHtml(r.class)}</span></td>
-      <td>${escHtml(r.command)}</td><td>${escHtml(r.object)}</td>
-      <td><code style="font-size:11px;word-break:break-all">${escHtml(r.statement)}</code></td>
-    </tr>`;
+    h += '<tr>';
+    src.cols.forEach(c => {
+      if (c.key === 'ts') h += `<td style="white-space:nowrap">${escHtml(r.ts)}</td>`;
+      else if (c.key === 'class') h += `<td><span class="badge badge-blue">${escHtml(r.class)}</span></td>`;
+      else if (c.key === 'statement') h += `<td><code style="font-size:11px;word-break:break-all">${escHtml(r.statement)}</code></td>`;
+      else h += `<td>${escHtml(r[c.key])}</td>`;
+    });
+    h += '</tr>';
   });
   h += '</tbody></table></div></div>';
   return h;
@@ -1564,6 +1616,130 @@ function resortAuditLog(instId, col) {
   st.sort.col = col;
   const wrap = document.getElementById('auditlog-wrap-' + instId);
   if (wrap) wrap.innerHTML = renderAuditLogTable(instId);
+}
+
+// ============================================================
+// SQL Console (Tab 6) — a lightweight in-browser psql: pick a database on
+// this instance, type SQL, run it against a fresh connection via
+// POST /api/instances/<id>/sql, render whatever comes back (a result set
+// or a rowcount/status). No session/transaction state persists between
+// runs — each call is its own autocommit connection, same as EXPLAIN.
+// ============================================================
+const sqlConsoleState = {}; // instId -> {dbname, sql, running, result, error}
+
+function getSqlConsoleState(instId, defaultDb) {
+  return sqlConsoleState[instId] || (sqlConsoleState[instId] = {
+    dbname: defaultDb, sql: '', running: false, result: null, error: null,
+  });
+}
+
+function buildSqlConsolePanel(inst, databases) {
+  const st = getSqlConsoleState(inst.id, inst.dbname);
+  const dbNames = [...new Set([inst.dbname, ...(databases || []).map(d => d.datname)].filter(Boolean))];
+
+  let h = '<div class="section-title">SQL Console</div>';
+  h += `<div style="margin-bottom:14px;padding:10px 14px;border-radius:8px;
+      background:color-mix(in srgb, var(--accent) 8%, var(--card));border:1px solid var(--accent);color:var(--accent2);font-size:13px">
+    ℹ Runs SQL directly against this instance with its stored credentials — the same access as connecting via <code>psql</code>.
+    Each run is its own connection with autocommit on; there's no persistent transaction or session state between runs, and no <code>psql</code> meta-commands (<code>\\d</code>, <code>\\timing</code>, …).
+  </div>`;
+
+  h += '<div class="card" style="padding:14px">';
+  h += '<div class="sql-console-toolbar">';
+  h += `<label style="font-size:12px;color:var(--muted)">Database</label>`;
+  h += `<select class="audit-class-select" onchange="setSqlConsoleDb('${escAttr(inst.id)}', this.value)">
+    ${dbNames.map(n => `<option value="${escAttr(n)}"${st.dbname===n?' selected':''}>${escHtml(n)}</option>`).join('')}
+  </select>`;
+  h += `<button class="btn btn-primary" ${st.running?'disabled':''} onclick="runSqlConsole('${escAttr(inst.id)}')">${st.running ? 'Running…' : 'Run  (Ctrl+Enter)'}</button>`;
+  h += '</div>';
+  h += `<textarea id="sql-console-input-${inst.id}" class="sql-console-textarea" spellcheck="false"
+      placeholder="SELECT * FROM ..."
+      oninput="setSqlConsoleText('${escAttr(inst.id)}', this.value)"
+      onkeydown="if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();runSqlConsole('${escAttr(inst.id)}');}"
+      >${escHtml(st.sql)}</textarea>`;
+  h += '</div>';
+  h += `<div id="sql-console-result-${inst.id}" style="margin-top:16px">${renderSqlConsoleResult(inst.id)}</div>`;
+  return h;
+}
+
+function setSqlConsoleDb(instId, value) {
+  getSqlConsoleState(instId).dbname = value;
+}
+
+function setSqlConsoleText(instId, value) {
+  getSqlConsoleState(instId).sql = value;
+}
+
+async function runSqlConsole(instId) {
+  const st = getSqlConsoleState(instId);
+  const sql = st.sql.trim();
+  if (!sql || st.running) return;
+
+  st.running = true;
+  st.error = null;
+  const btn = document.querySelector(`#content button[onclick="runSqlConsole('${instId}')"]`);
+  if (btn) { btn.disabled = true; btn.textContent = 'Running…'; }
+  const resultEl = document.getElementById('sql-console-result-' + instId);
+  if (resultEl) resultEl.innerHTML = '<div class="card" style="color:var(--muted);text-align:center;padding:20px">Running…</div>';
+
+  try {
+    const r = await fetch(`/api/instances/${encodeURIComponent(instId)}/sql`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sql, dbname: st.dbname }),
+    });
+    const data = await r.json();
+    if (!r.ok || data.error) {
+      st.result = null;
+      st.error = data.error || 'unknown error';
+    } else {
+      st.error = null;
+      st.result = data;
+    }
+  } catch (e) {
+    st.result = null;
+    st.error = e.message;
+  } finally {
+    st.running = false;
+    if (resultEl) resultEl.innerHTML = renderSqlConsoleResult(instId);
+    const btn2 = document.querySelector(`#content button[onclick="runSqlConsole('${instId}')"]`);
+    if (btn2) { btn2.disabled = false; btn2.textContent = 'Run  (Ctrl+Enter)'; }
+  }
+}
+
+function renderSqlConsoleResult(instId) {
+  const st = getSqlConsoleState(instId);
+  if (st.error) {
+    return `<div class="card" style="color:var(--red);padding:16px"><b>Error:</b> ${escHtml(st.error)}</div>`;
+  }
+  if (!st.result) {
+    return `<div class="card" style="color:var(--muted);text-align:center;padding:20px">Results will appear here after you run a statement.</div>`;
+  }
+  const { columns, rows, row_count, truncated, elapsed_ms, status } = st.result;
+
+  // psycopg2 reports rowcount -1 for statements with no defined row count
+  // (DDL, etc.) — omit the row count rather than showing a nonsense "-1".
+  const rowText = row_count < 0 ? '' : ` · ${fmtNum(row_count)} row${row_count===1?'':'s'}`;
+  let meta = `<div style="font-size:12px;color:var(--muted);margin-bottom:8px">${escHtml(status || '')}${rowText} · ${elapsed_ms} ms`
+    + (truncated ? ` · truncated to first ${fmtNum(rows.length)}` : '') + '</div>';
+
+  if (!columns) {
+    return meta + `<div class="card" style="color:var(--muted);text-align:center;padding:16px">No result set for this statement.</div>`;
+  }
+  if (!rows.length) {
+    return meta + `<div class="card" style="color:var(--muted);text-align:center;padding:16px">Query returned no rows.</div>`;
+  }
+
+  let h = meta + '<div class="card"><div class="tbl-wrap"><table><thead><tr>';
+  columns.forEach(c => { h += `<th>${escHtml(c)}</th>`; });
+  h += '</tr></thead><tbody>';
+  rows.forEach(row => {
+    h += '<tr>' + row.map(v =>
+      `<td><code style="font-size:11px;word-break:break-all">${v === null ? '<span style="color:var(--muted)">NULL</span>' : escHtml(String(v))}</code></td>`
+    ).join('') + '</tr>';
+  });
+  h += '</tbody></table></div></div>';
+  return h;
 }
 
 // ============================================================
