@@ -856,15 +856,44 @@ def api_explain(instance_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+    # pg_stat_statements/edb_stat_monitor are cluster-wide — a query logged
+    # against a different database than the instance's configured default
+    # (e.g. "app" vs. "postgres") is still visible here, but EXPLAINing it
+    # over this connection would fail with "relation does not exist" since a
+    # connection only sees objects in its own database. Look up which
+    # database it actually ran against so we can reconnect to that one below.
     try:
-        full_query = scalar(
-            conn,
-            f"SELECT query FROM {source_table} WHERE queryid = %s::bigint LIMIT 1",
-            (queryid,),
-        )
-        if not full_query:
+        if source_table == "pg_stat_statements":
+            row = query(conn, """
+                SELECT s.query AS query, d.datname AS dbname
+                FROM pg_stat_statements s
+                JOIN pg_database d ON d.oid = s.dbid
+                WHERE s.queryid = %s::bigint
+                LIMIT 1
+            """, (queryid,))
+        else:
+            row = query(conn, """
+                SELECT query, datname AS dbname
+                FROM edb_stat_monitor
+                WHERE queryid = %s::bigint
+                LIMIT 1
+            """, (queryid,))
+        if not row:
             return jsonify({"error": f"query not found — it may have aged out of {source_table}"}), 404
+        full_query, query_dbname = row[0]["query"], row[0]["dbname"]
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
 
+    target = dict(inst, dbname=query_dbname) if query_dbname else inst
+    try:
+        conn = psycopg2.connect(make_dsn(target))
+        conn.autocommit = True
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    try:
         pgver = scalar(conn, "SELECT current_setting('server_version_num')::int")
         try:
             if pgver and pgver >= 160000:
@@ -875,7 +904,7 @@ def api_explain(instance_id):
                 rows = query(conn, f"EXPLAIN (FORMAT TEXT) {approx_query}")
                 mode = "approximate"
             plan_text = "\n".join(r["QUERY PLAN"] for r in rows)
-            return jsonify({"plan": plan_text, "mode": mode, "query": full_query})
+            return jsonify({"plan": plan_text, "mode": mode, "query": full_query, "dbname": query_dbname})
         except Exception as e:
             return jsonify({"error": str(e), "query": full_query}), 400
     except Exception as e:
