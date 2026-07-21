@@ -328,10 +328,16 @@ def collect_instance(inst):
 
         # --- EDB extensions (graceful degradation, [] = installed+empty) --
         for name, sql in [
-            ("stat_monitor", "SELECT bucket_start_time,datname AS dbname,username,LEFT(query,100) AS query,"
-             "calls,ROUND(total_exec_time::numeric,2) AS total_ms,"
-             "ROUND(mean_exec_time::numeric,2) AS mean_ms,cpu_user_time,cpu_sys_time "
-             "FROM edb_stat_monitor ORDER BY total_exec_time DESC LIMIT 10"),
+            ("stat_monitor", "SELECT queryid::text AS queryid,MIN(LEFT(query,100)) AS query,"
+             "datname AS dbname,username,"
+             "string_agg(DISTINCT host(client_ip), ', ') AS client_ips,"
+             "SUM(calls) AS calls,"
+             "ROUND(SUM(total_exec_time)::numeric,2) AS total_ms,"
+             "ROUND((SUM(total_exec_time)/NULLIF(SUM(calls),0))::numeric,2) AS mean_ms,"
+             "SUM(cpu_user_time) AS cpu_user_time,SUM(cpu_sys_time) AS cpu_sys_time,"
+             "MAX(bucket_start_time) AS last_seen "
+             "FROM edb_stat_monitor GROUP BY queryid,datname,username "
+             "ORDER BY total_ms DESC LIMIT 10"),
             ("wait_states",  "SELECT wait_event_type AS wait_type, wait_event, count(*) AS cnt "
              "FROM edb_wait_states_data() GROUP BY wait_event_type, wait_event ORDER BY cnt DESC LIMIT 20"),
             ("index_advisor","SELECT index AS recommendation, estimated_size_in_bytes, "
@@ -638,18 +644,23 @@ def api_refresh_instance(instance_id):
 
 @app.route("/api/instances/<instance_id>/explain", methods=["POST"])
 def api_explain(instance_id):
-    """Look up a pg_stat_statements query by queryid and EXPLAIN it.
+    """Look up a query by queryid (from pg_stat_statements or edb_stat_monitor)
+    and EXPLAIN it.
 
-    Query text from pg_stat_statements is normalized ($1, $2, …) — there are
-    no real parameter values to substitute. On PG16+ we use EXPLAIN's
+    Query text from either source is normalized ($1, $2, …) — there are no
+    real parameter values to substitute. On PG16+ we use EXPLAIN's
     GENERIC_PLAN option, built for exactly this case. On older versions we
     fall back to substituting NULL for each placeholder, which yields a
     structurally correct but row-estimate-inaccurate plan.
     """
     body = request.get_json(force=True) or {}
     queryid = body.get("queryid")
+    source = body.get("source", "pg_stat_statements")
     if not queryid:
         return jsonify({"error": "missing queryid"}), 400
+    if source not in ("pg_stat_statements", "stat_monitor"):
+        return jsonify({"error": "invalid source"}), 400
+    source_table = "edb_stat_monitor" if source == "stat_monitor" else "pg_stat_statements"
 
     inst = next((i for i in get_instances() if i["id"] == instance_id), None)
     if not inst:
@@ -664,11 +675,11 @@ def api_explain(instance_id):
     try:
         full_query = scalar(
             conn,
-            "SELECT query FROM pg_stat_statements WHERE queryid = %s::bigint LIMIT 1",
+            f"SELECT query FROM {source_table} WHERE queryid = %s::bigint LIMIT 1",
             (queryid,),
         )
         if not full_query:
-            return jsonify({"error": "query not found — it may have aged out of pg_stat_statements"}), 404
+            return jsonify({"error": f"query not found — it may have aged out of {source_table}"}), 404
 
         pgver = scalar(conn, "SELECT current_setting('server_version_num')::int")
         try:

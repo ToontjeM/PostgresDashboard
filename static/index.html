@@ -1339,7 +1339,10 @@ function buildPanel(inst, d) {
   h4 += '</div></div>';
 
   // ── Top queries ──────────────────────────────────────────────
-  if ((d.top_queries||[]).length) {
+  // pg_stat_statements is only shown as a fallback: when EDB Stat Monitor
+  // data is present it's a superset (richer columns, same queries), so
+  // showing both would just be the same queries twice.
+  if ((d.top_queries||[]).length && !(d.stat_monitor||[]).length) {
     h4 += `<div id="topq-wrap-${inst.id}">${buildTopQueriesSection(inst.id, d.top_queries)}</div>`;
   }
 
@@ -1755,7 +1758,7 @@ function buildTopQueriesSection(instId, rows) {
   const sort = topQuerySort[instId] || { col: 'total_ms', dir: 'desc' };
   const sorted = sortRows(rows, sort);
 
-  let h = '<div class="section-title">Top Queries by Total Execution Time (pg_stat_statements) <small style="font-size:11px;color:var(--muted);font-weight:400">(click applicable rows for their execution plan)</small></div>';
+  let h = '<div class="section-title">Top Queries (pg_stat_statements) <small style="font-size:11px;color:var(--muted);font-weight:400">(click applicable rows for their execution plan)</small></div>';
   h += '<div class="card"><div class="tbl-wrap"><table><thead>';
   h += sortableHeaderRow(TOPQ_COLS, sort, 'resortTopQueries', instId);
   h += '</thead><tbody>';
@@ -1790,7 +1793,7 @@ function resortTopQueries(instId, col) {
 const statMonitorSort = {}; // instanceId -> {col, dir}
 
 const STAT_MONITOR_COLS = [
-  { key: 'bucket_start_time', label: 'Time'     },
+  { key: 'last_seen',         label: 'Last Seen'},
   { key: 'dbname',            label: 'DB'       },
   { key: 'username',          label: 'User'     },
   { key: 'query',             label: 'Query'    },
@@ -1805,14 +1808,18 @@ function buildStatMonitorSection(instId, rows) {
   const sort = statMonitorSort[instId] || { col: 'total_ms', dir: 'desc' };
   const sorted = sortRows(rows, sort);
 
-  let h = '<div class="section-title">EDB Stat Monitor</div><div class="card"><div class="tbl-wrap">';
+  let h = '<div class="section-title">Top Queries (EDB Stat Monitor) <small style="font-size:11px;color:var(--muted);font-weight:400">(click applicable rows for their execution plan)</small></div><div class="card"><div class="tbl-wrap">';
   h += '<table><thead>';
   h += sortableHeaderRow(STAT_MONITOR_COLS, sort, 'resortStatMonitor', instId);
   h += '</thead><tbody>';
   sorted.forEach(q => {
-    h += `<tr>
-      <td style="white-space:nowrap">${fmtDate(q.bucket_start_time)}</td>
-      <td>${escHtml(q.dbname||'')}</td><td>${escHtml(q.username||'')}</td>
+    const explainable = isExplainable(q.query);
+    const rowAttrs = explainable
+      ? `class="row-clickable" title="Click to view execution plan" onclick="explainQuery('${escAttr(instId)}','${escAttr(q.queryid)}','stat_monitor')"`
+      : `title="Execution plan not applicable for this statement type"`;
+    h += `<tr ${rowAttrs}>
+      <td style="white-space:nowrap">${fmtDate(q.last_seen)}</td>
+      <td>${escHtml(q.dbname||'')}</td><td${q.client_ips?` title="Client IP: ${escAttr(q.client_ips)}"`:''}>${escHtml(q.username||'')}</td>
       <td><code style="font-size:11px">${escHtml(q.query||'')}</code></td>
       <td>${fmtNum(q.calls)}</td><td>${fmtNum(q.total_ms)}</td><td>${fmtNum(q.mean_ms)}</td>
       <td>${fmtNum(q.cpu_user_time)}</td><td>${fmtNum(q.cpu_sys_time)}</td>
@@ -1867,7 +1874,7 @@ function resortWaitStates(instId, col) {
   if (wrap && rows) wrap.innerHTML = buildWaitStatesTable(instId, rows);
 }
 
-async function explainQuery(instId, queryid) {
+async function explainQuery(instId, queryid, source) {
   const overlay = document.getElementById('explain-overlay');
   const body    = document.getElementById('explain-body');
   const note    = document.getElementById('explain-note');
@@ -1879,7 +1886,7 @@ async function explainQuery(instId, queryid) {
     const r = await fetch(`/api/instances/${encodeURIComponent(instId)}/explain`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ queryid }),
+      body: JSON.stringify({ queryid, source: source || 'pg_stat_statements' }),
     });
     const data = await r.json();
     if (!r.ok || data.error) {
