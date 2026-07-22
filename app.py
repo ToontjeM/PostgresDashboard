@@ -280,6 +280,35 @@ def make_dsn(inst):
     )
 
 
+def friendly_connect_error(exc, inst=None):
+    """Translate a psycopg2 connection failure into a short, plain-language
+    message instead of the raw driver text — the raw exception is still
+    returned separately by callers (as error_detail) for anyone who wants
+    it, just not shown by default."""
+    raw = str(exc).strip().lower()
+    where = f" {inst['host']}:{inst['port']}" if inst else ""
+
+    if "could not translate host name" in raw or "name or service not known" in raw \
+            or "nodename nor servname" in raw or "temporary failure in name resolution" in raw:
+        return f"Couldn't resolve the hostname{where} — check that it's correct and reachable from this machine."
+    if "connection refused" in raw:
+        return f"Connection refused by{where} — the server may be down, or not listening on that port."
+    if "timeout expired" in raw or "timed out" in raw or "network is unreachable" in raw \
+            or "no route to host" in raw:
+        return f"Couldn't reach{where} — the host appears to be unreachable (timed out). Check the network or firewall."
+    if "password authentication failed" in raw or ("role" in raw and "does not exist" in raw):
+        return "Login failed — check the username and password for this instance."
+    if "database" in raw and "does not exist" in raw:
+        return "That database does not exist on this server — check the database name."
+    if "server closed the connection unexpectedly" in raw:
+        return "The server closed the connection unexpectedly — it may have crashed or been restarted."
+    if "ssl" in raw:
+        return "SSL connection failed — check the SSL settings for this instance."
+    if "too many clients" in raw or "too many connections" in raw:
+        return "The server rejected the connection: too many clients are already connected."
+    return f"Couldn't connect to this PostgreSQL instance{where} — check the host, port, and credentials."
+
+
 def query(conn, sql, params=None):
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(sql, params)
@@ -381,6 +410,12 @@ def collect_instance(inst):
     }
     try:
         conn = psycopg2.connect(make_dsn(inst))
+    except psycopg2.OperationalError as e:
+        result["error"]        = friendly_connect_error(e, inst)
+        result["error_detail"] = str(e).strip()
+        return result
+
+    try:
         conn.autocommit = True
 
         # --- Server version ------------------------------------------------
@@ -1108,6 +1143,8 @@ def api_cancel_backend(instance_id, pid):
         ok = scalar(conn, "SELECT pg_cancel_backend(%s)", (pid,))
         conn.close()
         return jsonify({"ok": bool(ok)})
+    except psycopg2.OperationalError as e:
+        return jsonify({"error": friendly_connect_error(e, inst), "error_detail": str(e).strip()}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1124,6 +1161,8 @@ def api_terminate_backend(instance_id, pid):
         ok = scalar(conn, "SELECT pg_terminate_backend(%s)", (pid,))
         conn.close()
         return jsonify({"ok": bool(ok)})
+    except psycopg2.OperationalError as e:
+        return jsonify({"error": friendly_connect_error(e, inst), "error_detail": str(e).strip()}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1155,8 +1194,8 @@ def api_explain(instance_id):
     try:
         conn = psycopg2.connect(make_dsn(inst))
         conn.autocommit = True
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except psycopg2.OperationalError as e:
+        return jsonify({"error": friendly_connect_error(e, inst), "error_detail": str(e).strip()}), 500
 
     # pg_stat_statements/edb_stat_monitor are cluster-wide — a query logged
     # against a different database than the instance's configured default
@@ -1192,8 +1231,8 @@ def api_explain(instance_id):
     try:
         conn = psycopg2.connect(make_dsn(target))
         conn.autocommit = True
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except psycopg2.OperationalError as e:
+        return jsonify({"error": friendly_connect_error(e, target), "error_detail": str(e).strip()}), 500
 
     try:
         pgver = scalar(conn, "SELECT current_setting('server_version_num')::int")
@@ -1230,8 +1269,8 @@ def api_index_recommendation_queries(instance_id):
     try:
         conn = psycopg2.connect(make_dsn(inst))
         conn.autocommit = True
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except psycopg2.OperationalError as e:
+        return jsonify({"error": friendly_connect_error(e, inst), "error_detail": str(e).strip()}), 500
 
     try:
         rows = query(
@@ -1271,8 +1310,8 @@ def api_database_schema(instance_id):
     try:
         conn = psycopg2.connect(make_dsn(target))
         conn.autocommit = True
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except psycopg2.OperationalError as e:
+        return jsonify({"error": friendly_connect_error(e, target), "error_detail": str(e).strip()}), 500
 
     try:
         schemas = [r["nspname"] for r in query(conn, """
@@ -1371,8 +1410,8 @@ def api_run_sql(instance_id):
     try:
         conn = psycopg2.connect(make_dsn(target))
         conn.autocommit = True
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except psycopg2.OperationalError as e:
+        return jsonify({"error": friendly_connect_error(e, target), "error_detail": str(e).strip()}), 500
 
     try:
         started = time.time()

@@ -1196,9 +1196,13 @@ function renderContent() {
     return;
   }
   if (d.error) {
+    const detail = d.error_detail || d.traceback;
     panel.innerHTML = `<div class="error-panel">
       <strong>&#x26A0; Connection error</strong> — ${escHtml(d.error)}
-      <pre>${escHtml(d.traceback || '')}</pre>
+      ${detail ? `<details style="margin-top:8px">
+        <summary style="cursor:pointer;font-size:11px;opacity:.75">Technical details</summary>
+        <pre>${escHtml(detail)}</pre>
+      </details>` : ''}
     </div>`;
     return;
   }
