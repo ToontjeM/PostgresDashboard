@@ -1677,9 +1677,7 @@ function buildConfigPanel(instId, settings, changes) {
     <div class="card-sub">needs a restart to take effect</div>`);
   h += '</div>';
 
-  h += `<div id="config-wrap-${instId}">${renderConfigTable(instId)}</div>`;
-
-  h += '<div class="section-title" style="margin-top:28px">Recent Changes</div>';
+  h += '<div class="section-title">Recent Changes</div>';
   h += '<div class="card"><div class="tbl-wrap">';
   if (!changes.length) {
     h += `<p style="color:var(--muted);padding:6px">No configuration changes recorded yet — history
@@ -1698,6 +1696,9 @@ function buildConfigPanel(instId, settings, changes) {
     h += '</tbody></table>';
   }
   h += '</div></div>';
+
+  h += `<div class="section-title" style="margin-top:28px">Parameters</div>`;
+  h += `<div id="config-wrap-${instId}">${renderConfigTable(instId)}</div>`;
 
   return h;
 }
