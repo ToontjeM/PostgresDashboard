@@ -751,6 +751,121 @@ def _avg_cache_hit(databases):
     return round(sum(vals) / len(vals), 2) if vals else 0
 
 
+def compute_advisories(result, history):
+    """Rule-based deviation/threshold checks over the freshly collected
+    result — a lightweight analogue to Foglight's baseline-deviation
+    advisories. Every field is read via .get() with a falsy default so this
+    degrades to an empty list rather than raising when `result` is a
+    partial/errored collection."""
+    advisories = []
+
+    def add(severity, category, title, detail):
+        advisories.append({"severity": severity, "category": category, "title": title, "detail": detail})
+
+    conns = result.get("connections") or {}
+    total, maxconn = conns.get("total") or 0, conns.get("max_connections") or 0
+    if maxconn:
+        pct = 100.0 * total / maxconn
+        if pct >= 95:
+            add("critical", "Resource Bottleneck", "Connections near limit",
+                f"{total} of {maxconn} connections in use ({pct:.0f}%).")
+        elif pct >= 80:
+            add("warning", "Resource Bottleneck", "High connection usage",
+                f"{total} of {maxconn} connections in use ({pct:.0f}%).")
+
+    idle_txn = conns.get("idle_in_txn") or 0
+    if idle_txn >= 10:
+        add("critical", "Contention", "Many idle-in-transaction sessions",
+            f"{idle_txn} sessions are idle in transaction — these hold locks and hold back vacuum.")
+    elif idle_txn >= 3:
+        add("warning", "Contention", "Idle-in-transaction sessions present",
+            f"{idle_txn} session(s) are idle in transaction.")
+
+    for db in result.get("databases") or []:
+        chr_ = db.get("cache_hit_ratio")
+        name = db.get("datname", "?")
+        if chr_ is not None and chr_ < 80:
+            add("critical", "Performance Deviation", f"Low cache hit ratio on {name}",
+                f"Only {chr_}% of reads served from shared_buffers — consider increasing shared_buffers.")
+        elif chr_ is not None and chr_ < 95:
+            add("warning", "Performance Deviation", f"Cache hit ratio below target on {name}",
+                f"{chr_}% of reads served from shared_buffers.")
+        if (db.get("deadlocks") or 0) > 0:
+            add("warning", "Contention", f"Deadlocks recorded on {name}",
+                f"{db['deadlocks']} deadlock(s) recorded since stats reset.")
+        if (db.get("temp_files") or 0) > 0:
+            add("info", "Performance Deviation", f"Temp files being written on {name}",
+                f"{db['temp_files']} temp file(s) — queries are spilling to disk; consider raising work_mem.")
+
+    for t in result.get("bloat_tables") or []:
+        dr = t.get("dead_ratio") or 0
+        rel = f"{t.get('schemaname')}.{t.get('relname')}"
+        if dr >= 40:
+            add("critical", "Address Resource Bottlenecks", f"Severe bloat on {rel}",
+                f"{dr}% dead tuples — autovacuum may be falling behind.")
+        elif dr >= 20:
+            add("warning", "Address Resource Bottlenecks", f"Table bloat on {rel}", f"{dr}% dead tuples.")
+
+    blocking = result.get("blocking_locks") or []
+    if blocking:
+        max_wait = max((b.get("blocked_duration_s") or 0) for b in blocking)
+        sev = "critical" if max_wait > 60 else "warning"
+        add(sev, "Reduce Contention", "Sessions currently blocked",
+            f"{len(blocking)} session(s) waiting on a lock, longest wait {max_wait}s.")
+
+    long_running = [b for b in result.get("backends") or []
+                    if b.get("state") == "active" and (b.get("query_duration_s") or 0) > 300]
+    if long_running:
+        add("warning", "Review Performance Deviations", "Long-running queries",
+            f"{len(long_running)} active quer{'y is' if len(long_running)==1 else 'ies are'} "
+            f"running longer than 5 minutes.")
+
+    bgw = result.get("bgwriter") or {}
+    req, timed = bgw.get("checkpoints_req") or 0, bgw.get("checkpoints_timed") or 0
+    if (req + timed) > 0 and req / (req + timed) > 0.5:
+        add("warning", "Address Resource Bottlenecks", "Frequent requested checkpoints",
+            f"{req} of {req + timed} checkpoints were requested rather than scheduled — "
+            f"consider raising max_wal_size.")
+
+    for r in result.get("replication") or []:
+        lag = r.get("replay_lag_bytes")
+        if lag is not None and lag > 100 * 1024 * 1024:
+            add("warning", "HA/DR", f"Replication lag on {r.get('client_addr') or 'standby'}",
+                f"Standby is {lag / 1024 / 1024:.0f} MB behind.")
+
+    pending = sum(1 for s in result.get("settings") or [] if s.get("pending_restart"))
+    if pending:
+        add("info", "Configuration", "Configuration changes pending restart",
+            f"{pending} parameter(s) changed but need a restart to take effect.")
+
+    if result.get("pg_latest_version"):
+        add("info", "Operational", "Newer PostgreSQL version available",
+            f"Running {result.get('pg_version_short')}; {result['pg_latest_version']} is available.")
+
+    tuner = result.get("pg_tuner")
+    if tuner and tuner.get("recommendations"):
+        add("info", "Configuration", "Tuning recommendations available",
+            f"EDB Tuner has {len(tuner['recommendations'])} recommendation(s) — "
+            f"see the Database Recommendations tab.")
+
+    # Baseline deviation: compare the just-recorded TPS sample against the
+    # mean/stddev of the recent in-memory history — the closest analogue to
+    # Foglight's workload-deviation advisories without a real anomaly model.
+    tps_hist = list(history.get("tps") or [])[:-1]  # exclude the sample just appended
+    if len(tps_hist) >= 5:
+        mean = sum(tps_hist) / len(tps_hist)
+        variance = sum((x - mean) ** 2 for x in tps_hist) / len(tps_hist)
+        stddev = variance ** 0.5
+        current = result.get("tps") or 0
+        if stddev > 0.01 and mean > 0.01 and current > mean + 3 * stddev:
+            add("info", "Review Performance Deviations", "Workload spike",
+                f"TPS ({current}) is well above its recent average ({mean:.1f} ± {stddev:.1f}).")
+
+    order = {"critical": 0, "warning": 1, "info": 2}
+    advisories.sort(key=lambda a: order.get(a["severity"], 3))
+    return advisories
+
+
 def collect_and_record(inst):
     """collect_instance(), plus append this sample to the instance's rolling
     trend history and attach that history to the result. A failed collection
@@ -803,6 +918,7 @@ def collect_and_record(inst):
             record_config_changes(inst_id, result.get("settings") or [])
         result["history"] = {k: list(v) for k, v in h.items()}
         result["config_changes"] = load_config_changes(inst_id, 200)
+        result["advisories"] = compute_advisories(result, h)
     return result
 
 
