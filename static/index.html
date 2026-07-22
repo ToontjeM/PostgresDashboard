@@ -107,6 +107,9 @@ body {
 .btn-primary { border-color: var(--accent); color: var(--accent); }
 .btn-primary:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
 .btn-danger  { border-color: var(--red);    color: var(--red); }
+.btn-xs { padding: 2px 8px; font-size: 11px; }
+.btn:disabled { opacity: .4; cursor: not-allowed; }
+.btn:disabled:hover { border-color: var(--border); color: var(--text2); }
 .btn-danger:hover  { background: color-mix(in srgb, var(--red) 12%, transparent); }
 
 /* --- Body row (sidebar + content) --- */
@@ -1145,6 +1148,7 @@ function buildPanel(inst, d) {
   const bgw        = d.bgwriter || {};
   const deadlocks  = (d.databases || []).reduce((s, db) => s + (db.deadlocks || 0), 0);
   const longCnt    = (d.long_queries || []).length;
+  const blockedCnt = new Set((d.blocking_locks || []).map(b => b.blocked_pid)).size;
   const tps        = parseFloat(d.tps || 0);
   tpsMax[inst.id]  = Math.max(tpsMax[inst.id] || 0, tps);
   const tpsPct     = tpsMax[inst.id] ? Math.round(100 * tps / tpsMax[inst.id]) : 0;
@@ -1220,9 +1224,20 @@ function buildPanel(inst, d) {
     <div class="card-value ${deadlocks>0?'red':'green'}">${deadlocks}</div>
     <div class="card-sub">total across all databases</div>`);
 
-  h += card('Long Queries (>1 s)', `
-    <div class="card-value ${longCnt>5?'red':longCnt>0?'amber':'green'}">${longCnt}</div>
-    <div class="card-sub">currently running</div>`);
+  h += card('Long Queries / Blocked', `
+    <div class="card-split">
+      <div>
+        <div class="card-split-label">Long Queries (>1 s)</div>
+        <div class="card-value lg ${longCnt>5?'red':longCnt>0?'amber':'green'}">${longCnt}</div>
+        <div class="card-sub">currently running</div>
+      </div>
+      <div class="card-split-divider"></div>
+      <div>
+        <div class="card-split-label">Blocked Sessions</div>
+        <div class="card-value lg ${blockedCnt>0?'red':'green'}">${blockedCnt}</div>
+        <div class="card-sub">waiting on a lock</div>
+      </div>
+    </div>`);
 
   h += '</div>';
 
@@ -1283,6 +1298,36 @@ function buildPanel(inst, d) {
     h += '</tbody></table></div></div>';
   }
 
+  // ── Blocking sessions ────────────────────────────────────────
+  h += '<div class="section-title">Blocking Sessions</div><div class="card"><div class="tbl-wrap">';
+  if (!(d.blocking_locks||[]).length) {
+    h += '<p style="color:var(--muted);padding:6px">No sessions are currently blocked.</p>';
+  } else {
+    h += `<table><thead><tr>
+      <th colspan="4" style="color:var(--red)">Blocked</th>
+      <th colspan="4" style="color:var(--amber)">Blocked By</th>
+    </tr><tr>
+      <th>PID</th><th>User / DB</th><th>Waiting</th><th>Query</th>
+      <th>PID</th><th>User / DB</th><th>State</th><th>Query</th>
+    </tr></thead><tbody>`;
+    d.blocking_locks.forEach(b => {
+      const bd = b.blocked_duration_s||0, kd = b.blocking_duration_s||0;
+      h += `<tr>
+        <td>${b.blocked_pid}</td>
+        <td>${escHtml(b.blocked_user||'')} / ${escHtml(b.blocked_db||'')}</td>
+        <td style="${bd>60?'color:var(--red)':bd>10?'color:var(--amber)':''}">${bd}s</td>
+        <td><code style="font-size:11px;word-break:break-all">${escHtml(b.blocked_query||'')}</code></td>
+        <td>${b.blocking_pid}</td>
+        <td>${escHtml(b.blocking_user||'')} / ${escHtml(b.blocking_db||'')}</td>
+        <td><span class="badge ${stateClass(b.blocking_state)}">${escHtml(b.blocking_state||'')}</span>
+          <div class="card-sub" style="margin-top:2px">${kd}s</div></td>
+        <td><code style="font-size:11px;word-break:break-all">${escHtml(b.blocking_query||'')}</code></td>
+      </tr>`;
+    });
+    h += '</tbody></table>';
+  }
+  h += '</div></div>';
+
   // ── Locks ────────────────────────────────────────────────────
   h += '<div class="section-title">Locks Summary</div><div class="card"><div class="tbl-wrap">';
   h += `<table><thead><tr><th>Type</th><th>Mode</th><th>Granted</th><th>Count</th></tr></thead><tbody>`;
@@ -1320,22 +1365,6 @@ function buildPanel(inst, d) {
   });
   h += '</tbody></table></div></div>';
 
-  // ── Configuration ────────────────────────────────────────────
-  const settings = d.settings || [];
-  h += '<div class="section-title">Key Configuration Parameters</div><div class="grid-2">';
-  const half = Math.ceil(settings.length / 2);
-  [settings.slice(0, half), settings.slice(half)].forEach(grp => {
-    h += '<div class="card"><div class="kv-list">';
-    grp.forEach(s => {
-      const val = s.setting + (s.unit ? ' ' + s.unit : '');
-      const src = s.source !== 'default'
-        ? `<span style="color:var(--accent);font-size:10px;margin-left:4px">[${s.source}]</span>` : '';
-      h += `<span class="kv-key">${escHtml(s.name)}</span><span class="kv-val">${escHtml(val)}${src}</span>`;
-    });
-    h += '</div></div>';
-  });
-  h += '</div>';
-
   const hOverview = h;
 
   // ============================================================
@@ -1356,27 +1385,8 @@ function buildPanel(inst, d) {
   // ============================================================
   let h4 = '';
 
-  // ── Long queries ─────────────────────────────────────────────
-  h4 += '<div class="section-title">Long-Running Queries</div><div class="card"><div class="tbl-wrap">';
-  if (!(d.long_queries||[]).length) {
-    h4 += '<p style="color:var(--muted);padding:6px">None at this time.</p>';
-  } else {
-    h4 += `<table><thead><tr>
-      <th>PID</th><th>User</th><th>DB</th><th>State</th><th>Duration</th><th>Wait</th><th>Query</th>
-    </tr></thead><tbody>`;
-    (d.long_queries||[]).forEach(q => {
-      const dur = q.duration_s;
-      h4 += `<tr>
-        <td>${q.pid}</td><td>${escHtml(q.usename||'')}</td><td>${escHtml(q.datname||'')}</td>
-        <td><span class="badge ${stateClass(q.state)}">${escHtml(q.state||'')}</span></td>
-        <td style="${dur>60?'color:var(--red)':dur>10?'color:var(--amber)':''}">${dur}s</td>
-        <td>${escHtml((q.wait_event_type||'')+(q.wait_event?' / '+q.wait_event:''))}</td>
-        <td><code style="font-size:11px;word-break:break-all">${escHtml(q.query||'')}</code></td>
-      </tr>`;
-    });
-    h4 += '</tbody></table>';
-  }
-  h4 += '</div></div>';
+  // ── Active sessions (live backend list with kill/cancel) ─────
+  h4 += `<div id="sessions-wrap-${inst.id}">${buildActiveSessionsSection(inst.id, d.backends)}</div>`;
 
   // ── Top queries ──────────────────────────────────────────────
   // pg_stat_statements is only shown as a fallback: when EDB Stat Monitor
@@ -1411,6 +1421,11 @@ function buildPanel(inst, d) {
   // ============================================================
   const h6 = buildSqlConsolePanel(inst, d.databases);
 
+  // ============================================================
+  // Tab 7 — Configuration
+  // ============================================================
+  const h7 = buildConfigPanel(inst.id, d.settings, d.config_changes);
+
   const TABS = [
     { id: 'host',            label: 'Host Statistics',          html: h3 },
     { id: 'overview',        label: 'Database Overview',        html: hOverview },
@@ -1418,6 +1433,7 @@ function buildPanel(inst, d) {
     { id: 'recommendations', label: 'Database Recommendations', html: h2 },
     { id: 'audit',           label: 'Audit Logs',               html: h5 },
     { id: 'sql',             label: 'SQL Console',              html: h6 },
+    { id: 'config',          label: 'Configuration',            html: h7 },
   ];
 
   let out = '<div class="tabs-bar">';
@@ -1616,6 +1632,141 @@ function resortAuditLog(instId, col) {
   st.sort.col = col;
   const wrap = document.getElementById('auditlog-wrap-' + instId);
   if (wrap) wrap.innerHTML = renderAuditLogTable(instId);
+}
+
+// ============================================================
+// Configuration (Tab 7) — full pg_settings browser plus a change-history
+// feed built from diffs the backend records on every poll.
+// ============================================================
+const configState = {}; // instId -> {search, changedOnly, sort:{col,dir}}
+const configRows  = {}; // instId -> raw settings rows from the last poll
+
+const CONFIG_COLS = [
+  { key: 'name',            label: 'Name'     },
+  { key: 'setting',         label: 'Current'  },
+  { key: 'unit',            label: 'Unit'     },
+  { key: 'boot_val',        label: 'Default'  },
+  { key: 'source',          label: 'Source'   },
+  { key: 'context',         label: 'Context'  },
+  { key: 'non_default',     label: 'Changed'  },
+  { key: 'pending_restart', label: 'Restart?' },
+];
+
+function getConfigState(instId) {
+  return configState[instId] || (configState[instId] = { search: '', changedOnly: false, sort: { col: 'name', dir: 'asc' } });
+}
+
+function buildConfigPanel(instId, settings, changes) {
+  settings = settings || [];
+  changes  = changes  || [];
+  configRows[instId] = settings;
+
+  const nonDefaultCnt = settings.filter(s => s.non_default).length;
+  const pendingCnt    = settings.filter(s => s.pending_restart).length;
+
+  let h = '<div class="section-title">Configuration</div>';
+  h += '<div class="grid-3" style="margin-bottom:18px">';
+  h += card('Total Parameters', `
+    <div class="card-value lg">${settings.length}</div>
+    <div class="card-sub">visible via pg_settings</div>`);
+  h += card('Changed From Default', `
+    <div class="card-value ${nonDefaultCnt>0?'amber':'green'}">${nonDefaultCnt}</div>
+    <div class="card-sub">non-default value</div>`);
+  h += card('Pending Restart', `
+    <div class="card-value ${pendingCnt>0?'red':'green'}">${pendingCnt}</div>
+    <div class="card-sub">needs a restart to take effect</div>`);
+  h += '</div>';
+
+  h += `<div id="config-wrap-${instId}">${renderConfigTable(instId)}</div>`;
+
+  h += '<div class="section-title" style="margin-top:28px">Recent Changes</div>';
+  h += '<div class="card"><div class="tbl-wrap">';
+  if (!changes.length) {
+    h += `<p style="color:var(--muted);padding:6px">No configuration changes recorded yet — history
+      accumulates from this dashboard's polling, starting the first time a value changes after it's
+      been observed once.</p>`;
+  } else {
+    h += `<table><thead><tr><th>Time</th><th>Parameter</th><th>Old Value</th><th>New Value</th></tr></thead><tbody>`;
+    changes.forEach(c => {
+      h += `<tr>
+        <td style="white-space:nowrap">${fmtDate(c.ts)}</td>
+        <td><code style="font-size:11px">${escHtml(c.name)}</code></td>
+        <td>${escHtml(c.old_value ?? '')}</td>
+        <td style="color:var(--accent)">${escHtml(c.new_value ?? '')}</td>
+      </tr>`;
+    });
+    h += '</tbody></table>';
+  }
+  h += '</div></div>';
+
+  return h;
+}
+
+function renderConfigTable(instId) {
+  const st = getConfigState(instId);
+  const rows0 = configRows[instId] || [];
+  const search = st.search.trim().toLowerCase();
+  let rows = rows0.filter(s => {
+    if (st.changedOnly && !s.non_default) return false;
+    if (!search) return true;
+    return Object.values(s).some(v => String(v ?? '').toLowerCase().includes(search));
+  });
+  rows = sortRows(rows, st.sort);
+
+  let h = '<div class="audit-toolbar">';
+  h += `<input class="audit-search-input" placeholder="Search parameter, value, source…"
+          value="${escAttr(st.search)}" oninput="setConfigSearch('${escAttr(instId)}', this.value)">`;
+  h += `<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text2);white-space:nowrap">
+          <input type="checkbox" ${st.changedOnly?'checked':''} onchange="setConfigChangedOnly('${escAttr(instId)}', this.checked)">
+          Changed from default only
+        </label>`;
+  h += `<span style="font-size:12px;color:var(--muted)">${rows.length} of ${rows0.length}</span>`;
+  h += '</div>';
+
+  h += '<div class="card"><div class="tbl-wrap"><table><thead>';
+  h += sortableHeaderRow(CONFIG_COLS, st.sort, 'resortConfig', instId);
+  h += '</thead><tbody>';
+  if (!rows.length) {
+    h += `<tr><td colspan="${CONFIG_COLS.length}" style="color:var(--muted);text-align:center;padding:16px">No matching parameters.</td></tr>`;
+  }
+  rows.forEach(s => {
+    const val = s.setting + (s.unit ? ' ' + s.unit : '');
+    h += `<tr title="${escAttr(s.short_desc||'')}">
+      <td><code style="font-size:11px">${escHtml(s.name)}</code></td>
+      <td>${escHtml(val)}</td>
+      <td>${escHtml(s.unit||'')}</td>
+      <td>${escHtml(s.boot_val||'')}</td>
+      <td>${escHtml(s.source||'')}</td>
+      <td>${escHtml(s.context||'')}</td>
+      <td>${s.non_default ? '<span class="badge badge-amber">Yes</span>' : '<span class="badge">No</span>'}</td>
+      <td>${s.pending_restart ? '<span class="badge badge-red">Yes</span>' : '—'}</td>
+    </tr>`;
+  });
+  h += '</tbody></table></div></div>';
+  return h;
+}
+
+function setConfigSearch(instId, value) {
+  getConfigState(instId).search = value;
+  const wrap = document.getElementById('config-wrap-' + instId);
+  if (!wrap) return;
+  wrap.innerHTML = renderConfigTable(instId);
+  const inp = wrap.querySelector('.audit-search-input');
+  if (inp) { inp.focus(); const p = inp.value.length; inp.setSelectionRange(p, p); }
+}
+
+function setConfigChangedOnly(instId, checked) {
+  getConfigState(instId).changedOnly = checked;
+  const wrap = document.getElementById('config-wrap-' + instId);
+  if (wrap) wrap.innerHTML = renderConfigTable(instId);
+}
+
+function resortConfig(instId, col) {
+  const st = getConfigState(instId);
+  st.sort.dir = (st.sort.col === col && st.sort.dir === 'desc') ? 'asc' : 'desc';
+  st.sort.col = col;
+  const wrap = document.getElementById('config-wrap-' + instId);
+  if (wrap) wrap.innerHTML = renderConfigTable(instId);
 }
 
 // ============================================================
@@ -2115,6 +2266,64 @@ function sortableHeaderRow(cols, sort, onclickFn, instId) {
     h += `<th class="sortable-th" style="${active?'color:var(--accent)':''}" onclick="${onclickFn}('${escAttr(instId)}','${c.key}')">${escHtml(c.label)}${arrow}</th>`;
   });
   return h + '</tr>';
+}
+
+function buildActiveSessionsSection(instId, rows) {
+  rows = rows || [];
+  let h = `<div class="section-title">Active Sessions <small style="font-size:11px;color:var(--muted);font-weight:400">(${rows.length} connection(s), excluding this dashboard)</small></div>`;
+  h += '<div class="card"><div class="tbl-wrap">';
+  if (!rows.length) {
+    h += '<p style="color:var(--muted);padding:6px">No other client connections.</p>';
+  } else {
+    h += `<table><thead><tr>
+      <th>PID</th><th>User / DB</th><th>App</th><th>Client</th><th>State</th>
+      <th>Query Time</th><th>Xact Time</th><th>Wait</th><th>Query</th><th>Actions</th>
+    </tr></thead><tbody>`;
+    rows.forEach(q => {
+      const qd = q.query_duration_s, xd = q.xact_duration_s;
+      const isActive = q.state === 'active';
+      h += `<tr>
+        <td>${q.pid}</td>
+        <td>${escHtml(q.usename||'')} / ${escHtml(q.datname||'')}</td>
+        <td>${escHtml(q.application_name||'')}</td>
+        <td>${escHtml(q.client_addr||'local')}</td>
+        <td><span class="badge ${stateClass(q.state)}">${escHtml(q.state||'')}</span></td>
+        <td style="${qd>60?'color:var(--red)':qd>10?'color:var(--amber)':''}">${qd!=null?qd+'s':'—'}</td>
+        <td>${xd!=null?xd+'s':'—'}</td>
+        <td>${escHtml((q.wait_event_type||'')+(q.wait_event?' / '+q.wait_event:''))}</td>
+        <td><code style="font-size:11px;word-break:break-all">${escHtml(q.query||'')}</code></td>
+        <td style="white-space:nowrap">
+          <button class="btn btn-xs" ${isActive?'':'disabled title="No query running to cancel"'}
+            onclick="killBackend('${escAttr(instId)}',${q.pid},'cancel')">Cancel</button>
+          <button class="btn btn-xs btn-danger" style="margin-left:4px"
+            onclick="killBackend('${escAttr(instId)}',${q.pid},'terminate')">Terminate</button>
+        </td>
+      </tr>`;
+    });
+    h += '</tbody></table>';
+  }
+  h += '</div></div>';
+  return h;
+}
+
+async function killBackend(instId, pid, action) {
+  const verb = action === 'terminate' ? 'terminate' : 'cancel the current query of';
+  if (!confirm(`Really ${verb} backend PID ${pid} on this instance?`)) return;
+  try {
+    const r = await fetch(`/api/instances/${encodeURIComponent(instId)}/backends/${pid}/${action}`, { method: 'POST' });
+    const data = await r.json();
+    if (!r.ok || data.error) {
+      alert('Error: ' + (data.error || 'unknown error'));
+      return;
+    }
+    // Pull a fresh snapshot for this instance so the session list reflects
+    // the action immediately instead of waiting for the next 10s poll.
+    const fresh = await fetch(`/api/instances/${encodeURIComponent(instId)}/refresh`, { method: 'POST' });
+    allData[instId] = await fresh.json();
+    renderContent();
+  } catch (e) {
+    alert('Error: ' + e.message);
+  }
 }
 
 function buildTopQueriesSection(instId, rows) {

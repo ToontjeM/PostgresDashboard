@@ -125,6 +125,93 @@ def init_trend_db():
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_trend_samples_inst ON trend_samples(instance_id)"
             )
+            # config_snapshot holds only the latest known value per parameter,
+            # so each poll can cheaply diff "did this change since last time"
+            # without re-scanning the append-only config_changes log.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS config_snapshot (
+                    instance_id TEXT NOT NULL,
+                    name        TEXT NOT NULL,
+                    value       TEXT,
+                    PRIMARY KEY (instance_id, name)
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS config_changes (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    instance_id TEXT NOT NULL,
+                    name        TEXT NOT NULL,
+                    old_value   TEXT,
+                    new_value   TEXT,
+                    ts          TEXT NOT NULL
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_config_changes_inst ON config_changes(instance_id)"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def record_config_changes(inst_id, settings_rows):
+    """Diff this poll's pg_settings against the last-known snapshot and log
+    any differences to config_changes. A parameter with no prior snapshot
+    value — either a brand-new instance, or a GUC that's newly visible
+    (e.g. an extension just got loaded) — is seeded silently: there's
+    nothing real to diff it against yet, so logging a "changed" event for
+    it would just be noise."""
+    if not settings_rows:
+        return
+    with _trend_db_lock:
+        conn = _trend_db_connect()
+        try:
+            cur = conn.execute(
+                "SELECT name, value FROM config_snapshot WHERE instance_id = ?", (inst_id,)
+            )
+            prev = dict(cur.fetchall())
+            now_iso = datetime.now(timezone.utc).isoformat()
+            for row in settings_rows:
+                name, val = row["name"], row["setting"]
+                old = prev.get(name)
+                if old is not None and old != val:
+                    conn.execute(
+                        "INSERT INTO config_changes (instance_id, name, old_value, new_value, ts) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (inst_id, name, old, val, now_iso),
+                    )
+                conn.execute(
+                    "INSERT INTO config_snapshot (instance_id, name, value) VALUES (?, ?, ?) "
+                    "ON CONFLICT(instance_id, name) DO UPDATE SET value = excluded.value",
+                    (inst_id, name, val),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def load_config_changes(inst_id, limit=200):
+    """Most recent config changes for one instance, newest first."""
+    with _trend_db_lock:
+        conn = _trend_db_connect()
+        try:
+            cur = conn.execute(
+                "SELECT name, old_value, new_value, ts FROM config_changes "
+                "WHERE instance_id = ? ORDER BY id DESC LIMIT ?",
+                (inst_id, limit),
+            )
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+    return [{"name": n, "old_value": o, "new_value": nv, "ts": t} for n, o, nv, t in rows]
+
+
+def delete_config_history(inst_id):
+    with _trend_db_lock:
+        conn = _trend_db_connect()
+        try:
+            conn.execute("DELETE FROM config_snapshot WHERE instance_id = ?", (inst_id,))
+            conn.execute("DELETE FROM config_changes WHERE instance_id = ?", (inst_id,))
             conn.commit()
         finally:
             conn.close()
@@ -419,12 +506,53 @@ def collect_instance(inst):
             ORDER BY duration_s DESC LIMIT 20
         """)
 
+        # --- Backends (Tab 4: live session list with kill/cancel) ----------
+        # Own connection excluded via pg_backend_pid() so the dashboard's
+        # own polling session doesn't show up as something to kill.
+        result["backends"] = query(conn, """
+            SELECT pid, usename, datname, application_name,
+                   client_addr::text AS client_addr, state,
+                   EXTRACT(EPOCH FROM (now() - query_start))::int AS query_duration_s,
+                   EXTRACT(EPOCH FROM (now() - xact_start))::int  AS xact_duration_s,
+                   wait_event_type, wait_event,
+                   LEFT(query, 300) AS query
+            FROM pg_stat_activity
+            WHERE backend_type = 'client backend'
+              AND pid != pg_backend_pid()
+            ORDER BY query_start ASC NULLS LAST
+            LIMIT 200
+        """)
+
         # --- Locks ---------------------------------------------------------
         result["locks"] = query(conn, """
             SELECT l.mode, l.locktype, l.granted, count(*) AS cnt
             FROM pg_locks l
             GROUP BY l.mode, l.locktype, l.granted
             ORDER BY cnt DESC LIMIT 20
+        """)
+
+        # --- Blocking lock chains --------------------------------------
+        # One row per (blocked, blocker) pair via pg_blocking_pids() — a
+        # session blocked by two others produces two rows, and a multi-level
+        # chain (A waits on B waits on C) surfaces as separate blocked=B/
+        # blocking=C and blocked=A/blocking=B rows that the UI links up.
+        result["blocking_locks"] = query(conn, """
+            SELECT blocked.pid                                              AS blocked_pid,
+                   blocked.usename                                          AS blocked_user,
+                   blocked.datname                                          AS blocked_db,
+                   EXTRACT(EPOCH FROM (now() - blocked.query_start))::int   AS blocked_duration_s,
+                   LEFT(blocked.query, 200)                                 AS blocked_query,
+                   blocker.pid                                              AS blocking_pid,
+                   blocker.usename                                          AS blocking_user,
+                   blocker.datname                                          AS blocking_db,
+                   blocker.state                                            AS blocking_state,
+                   EXTRACT(EPOCH FROM (now() - blocker.query_start))::int   AS blocking_duration_s,
+                   LEFT(blocker.query, 200)                                 AS blocking_query
+            FROM pg_stat_activity blocked
+            JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS b(pid) ON true
+            JOIN pg_stat_activity blocker ON blocker.pid = b.pid
+            ORDER BY blocked_duration_s DESC NULLS LAST
+            LIMIT 50
         """)
 
         # --- WAL -------------------------------------------------------------
@@ -598,19 +726,15 @@ def collect_instance(inst):
             ORDER BY size_bytes DESC NULLS LAST
         """)
 
-        # --- Key settings --------------------------------------------------
+        # --- Settings (Tab 7: Configuration) --------------------------------
+        # The full table, not a curated subset — cheap to query and lets the
+        # UI offer search/sort plus a "changed from default" / "pending
+        # restart" view across every GUC, not just a hand-picked list.
         result["settings"] = query(conn, """
-            SELECT name, setting, unit, source
+            SELECT name, setting, unit, category, short_desc, context, vartype,
+                   source, sourcefile, boot_val, pending_restart,
+                   (setting IS DISTINCT FROM boot_val) AS non_default
             FROM pg_settings
-            WHERE name IN (
-                'max_connections','shared_buffers','work_mem','maintenance_work_mem',
-                'effective_cache_size','checkpoint_completion_target',
-                'wal_level','max_wal_size','autovacuum','log_min_duration_statement',
-                'track_activity_query_size','default_statistics_target',
-                'random_page_cost','effective_io_concurrency','wal_buffers',
-                'wal_compression','archive_mode','synchronous_commit',
-                'max_worker_processes','max_parallel_workers'
-            )
             ORDER BY name
         """)
 
@@ -676,7 +800,9 @@ def collect_and_record(inst):
             h["conn"].append(conn_total)
             h["cache"].append(cache_hit)
             record_trend_sample(inst_id, now_dt.isoformat(), tps, conn_total, cache_hit)
+            record_config_changes(inst_id, result.get("settings") or [])
         result["history"] = {k: list(v) for k, v in h.items()}
+        result["config_changes"] = load_config_changes(inst_id, 200)
     return result
 
 
@@ -784,6 +910,7 @@ def api_remove_instance(instance_id):
         _history.pop(instance_id, None)
         _prev_xact.pop(instance_id, None)
     delete_trend_history(instance_id)
+    delete_config_history(instance_id)
 
     return jsonify({"ok": True})
 
@@ -824,6 +951,38 @@ def api_refresh_instance(instance_id):
         _cache[instance_id] = data
         _cache["_refreshed"] = datetime.now(timezone.utc).isoformat()
     return jsonify(data)
+
+
+@app.route("/api/instances/<instance_id>/backends/<int:pid>/cancel", methods=["POST"])
+def api_cancel_backend(instance_id, pid):
+    """pg_cancel_backend — stops the backend's current query, connection stays open."""
+    inst = next((i for i in get_instances() if i["id"] == instance_id), None)
+    if not inst:
+        return jsonify({"error": "not found"}), 404
+    try:
+        conn = psycopg2.connect(make_dsn(inst))
+        conn.autocommit = True
+        ok = scalar(conn, "SELECT pg_cancel_backend(%s)", (pid,))
+        conn.close()
+        return jsonify({"ok": bool(ok)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/instances/<instance_id>/backends/<int:pid>/terminate", methods=["POST"])
+def api_terminate_backend(instance_id, pid):
+    """pg_terminate_backend — drops the backend's connection entirely."""
+    inst = next((i for i in get_instances() if i["id"] == instance_id), None)
+    if not inst:
+        return jsonify({"error": "not found"}), 404
+    try:
+        conn = psycopg2.connect(make_dsn(inst))
+        conn.autocommit = True
+        ok = scalar(conn, "SELECT pg_terminate_backend(%s)", (pid,))
+        conn.close()
+        return jsonify({"ok": bool(ok)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/instances/<instance_id>/explain", methods=["POST"])
