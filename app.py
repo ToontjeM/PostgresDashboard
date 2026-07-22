@@ -493,6 +493,25 @@ def collect_instance(inst):
             ORDER BY n_dead_tup DESC LIMIT 10
         """)
 
+        # --- Unused indexes (Tab 2: Database Recommendations) --------------
+        # Primary key / unique indexes are excluded even at idx_scan = 0 —
+        # they usually exist to enforce a constraint rather than to serve
+        # reads, so "unused" doesn't mean "safe to drop" for them the way it
+        # does for a plain secondary index.
+        result["unused_indexes"] = query(conn, """
+            SELECT s.schemaname, s.relname AS tablename, s.indexrelname AS indexname,
+                   s.idx_scan,
+                   pg_relation_size(s.indexrelid)                    AS index_size_bytes,
+                   pg_size_pretty(pg_relation_size(s.indexrelid))     AS index_size_pretty
+            FROM pg_stat_user_indexes s
+            JOIN pg_index i ON i.indexrelid = s.indexrelid
+            WHERE s.idx_scan = 0
+              AND NOT i.indisprimary
+              AND NOT i.indisunique
+            ORDER BY pg_relation_size(s.indexrelid) DESC
+            LIMIT 30
+        """)
+
         # --- Long-running queries ------------------------------------------
         result["long_queries"] = query(conn, """
             SELECT pid, usename, datname, state,
@@ -805,6 +824,14 @@ def compute_advisories(result, history):
                 f"{dr}% dead tuples — autovacuum may be falling behind.")
         elif dr >= 20:
             add("warning", "Address Resource Bottlenecks", f"Table bloat on {rel}", f"{dr}% dead tuples.")
+
+    unused = result.get("unused_indexes") or []
+    if unused:
+        total_bytes = sum(u.get("index_size_bytes") or 0 for u in unused)
+        sev = "warning" if total_bytes > 1024 * 1024 * 1024 else "info"
+        add(sev, "Address Resource Bottlenecks", "Unused indexes found",
+            f"{len(unused)} index(es) with zero scans, {total_bytes / 1024 / 1024:.0f} MB total — "
+            f"see Database Recommendations for details.")
 
     blocking = result.get("blocking_locks") or []
     if blocking:
